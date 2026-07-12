@@ -79,6 +79,35 @@ where
         self.try_with_vm_result(|vm| vm.hydrate_from_mpc_engine())
     }
 
+    /// Snapshot durable MPC state (preprocessing pool + reservations) after a
+    /// job has consumed material.
+    ///
+    /// This is the restart-durability point: once the in-memory preprocessing
+    /// pool and reservation cursor are persisted, a killed+restarted node
+    /// resumes from the reduced pool and advanced cursor instead of
+    /// regenerating or replaying spent material. Engines that do not advertise
+    /// the capability are skipped; engines without an attached store no-op
+    /// inside the persist call.
+    pub async fn persist_durability_state(&self) -> MpcRunnerResult<()> {
+        if self.mpc_engine.supports_preproc_persistence() {
+            self.mpc_engine
+                .preproc_persistence_ops()
+                .map_mpc_runner_backend_err("preproc_persistence_ops")?
+                .persist_preprocessing()
+                .await
+                .map_mpc_runner_backend_err("persist_preprocessing")?;
+        }
+        if self.mpc_engine.supports_reservation() {
+            self.mpc_engine
+                .reservation_ops()
+                .map_mpc_runner_backend_err("reservation_ops")?
+                .persist_reservations()
+                .await
+                .map_mpc_runner_backend_err("persist_reservations")?;
+        }
+        Ok(())
+    }
+
     /// Inspect the managed VM without exposing the runner's internal VM slot.
     ///
     /// Returns [`MpcRunnerError::VmAlreadyExecuting`] when the VM is temporarily
@@ -155,6 +184,11 @@ where
         })
         .await
         .map_err(|_| MpcRunnerError::ExecutionTimedOut { timeout })??;
+
+        // Persist the reduced preprocessing pool + reservation cursor so a
+        // kill+restart after this job resumes without regenerating or
+        // replaying spent material.
+        self.persist_durability_state().await?;
 
         Ok(MpcExecutionResult {
             value: result,
@@ -349,6 +383,8 @@ where
         vm_guard.restore()?;
         let result = execution.map_err(|_| MpcRunnerError::ExecutionTimedOut { timeout })??;
 
+        self.persist_durability_state().await?;
+
         Ok(MpcExecutionResult {
             value: result,
             clients_hydrated,
@@ -381,6 +417,8 @@ where
         )
         .await;
         let result = execution.map_err(|_| MpcRunnerError::ExecutionTimedOut { timeout })??;
+
+        self.persist_durability_state().await?;
 
         Ok(MpcExecutionResult {
             value: result,

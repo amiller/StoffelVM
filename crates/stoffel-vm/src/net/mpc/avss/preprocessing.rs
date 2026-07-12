@@ -137,7 +137,7 @@ where
     /// Persist current AVSS preprocessing material to the store.
     ///
     /// Drains and serializes inside the lock, then stores after releasing.
-    async fn persist_preproc(&self) -> Result<(), String> {
+    pub(crate) async fn persist_preproc(&self) -> Result<(), String> {
         let store = self.preproc_store.read().await.clone();
         let config = *self.preproc_config.read().await;
         let (store, (hash, field_kind)) = match (store, config) {

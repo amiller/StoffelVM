@@ -10,6 +10,7 @@ pub mod ed25519_compat;
 pub mod leader_bootnode_integration;
 #[cfg(feature = "hb_itest")]
 pub mod mpc_multiplication_integration;
+pub mod node_persistence_restart_integration;
 pub mod p2p_integration;
 pub mod test_utils;
 #[cfg(feature = "avss_itest")]

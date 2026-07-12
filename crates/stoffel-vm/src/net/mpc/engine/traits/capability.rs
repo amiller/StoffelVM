@@ -149,6 +149,13 @@ pub trait MpcEngineFieldOpen: MpcEngine {
 /// preprocessing artifacts under a program-specific hash before `start()` or
 /// `preprocess()` is called. Unsupported engines fail explicitly instead of
 /// accepting a store and silently ignoring it.
+///
+/// Durability model: generation persists the full pool, the next
+/// `preprocess()` loads it, and `persist_preprocessing` snapshots the
+/// *remaining* in-memory pool after a job consumes material. Calling
+/// `persist_preprocessing` after consumption is what prevents a killed node
+/// from regenerating or reloading already-spent triples on restart.
+#[async_trait::async_trait]
 pub trait MpcEnginePreprocPersistence: MpcEngine {
     /// Attach persistent storage for preprocessing material caching.
     fn set_preproc_store(
@@ -156,6 +163,14 @@ pub trait MpcEnginePreprocPersistence: MpcEngine {
         store: Arc<dyn PreprocStore>,
         program_hash: [u8; 32],
     ) -> MpcEngineResult<()>;
+
+    /// Snapshot the current in-memory preprocessing pool to the durable store.
+    ///
+    /// Must be called after a job has consumed material (multiplications,
+    /// random-share draws) so that a subsequent restart resumes from the
+    /// reduced pool instead of regenerating or replaying spent triples. No-ops
+    /// (returning `Ok`) when no store is attached.
+    async fn persist_preprocessing(&self) -> MpcEngineResult<()>;
 }
 
 /// Extended MPC engine trait for sending private outputs to clients.

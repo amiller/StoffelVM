@@ -46,6 +46,7 @@ where
     }
 }
 
+#[async_trait::async_trait]
 impl<F, G> MpcEnginePreprocPersistence for HoneyBadgerMpcEngine<F, G>
 where
     F: SupportedMpcField,
@@ -62,6 +63,12 @@ where
             Ok(())
         })
         .map_mpc_engine_operation("set_preproc_store")
+    }
+
+    async fn persist_preprocessing(&self) -> MpcEngineResult<()> {
+        self.persist_preproc()
+            .await
+            .map_mpc_engine_operation("persist_preprocessing")
     }
 }
 

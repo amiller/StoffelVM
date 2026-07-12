@@ -267,7 +267,7 @@ where
     ///
     /// Drains and serializes material inside the lock, then releases the lock
     /// before the async store writes to minimise lock hold time.
-    async fn persist_preproc(&self) -> Result<(), String> {
+    pub(crate) async fn persist_preproc(&self) -> Result<(), String> {
         let store = self.preproc_store.read().await.clone();
         let hash = *self.program_hash.read().await;
         let (store, hash) = match (store, hash) {
