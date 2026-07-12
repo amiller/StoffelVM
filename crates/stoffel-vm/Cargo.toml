@@ -76,6 +76,9 @@ nat = []
 criterion = { version = "0.6.0", features = ["html_reports"] }
 k256 = { version = "0.13", features = ["ecdsa"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
+# Test-only (core_vm/tests.rs, tests/aes_count.rs) — all compiled under cfg(test)/dev-deps.
+# Keep stoffellang out of [dependencies] so node runtime builds exclude the compiler
+# entirely (node image slimming; mpc-node-attestation-spec W1).
 stoffellang = { version = "0.1.1", path = "../stoffel-lang" }
 tempfile = "3"
 turmoil = "0.7"
