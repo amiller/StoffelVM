@@ -75,6 +75,21 @@ mechanical/wiring items (W1, W4). W2 straddles but was run on 5.1 and did compet
 - **Success:** docker harness — `curl`/client submits a small program to one node; committee syncs by
   hash and runs; result returned; a tampered program (wrong hash) is rejected.
 
+**Status (implemented):** `crates/stoffel-vm/src/net/submission.rs` is the thin entrypoint. `prepare_submission`
+computes the blake3 id, validates an optional client-claimed id (`SubmissionError::ProgramTampered` on
+mismatch — no fallback), and seeds the content-addressed cache via `program_sync`. `handle_submission`
+dispatches a host-supplied `CommitteeRunner` (which runs `agree_and_sync_program` + the committee run and
+reuses `client_store` for inputs). `serve_submission_tcp` / `submit_tcp` add length-prefixed TCP framing.
+The W4 committee runner is wired and verified by `crates/stoffel-vm/src/tests/program_submission_integration.rs`
+(`hb_itest`): a real 5-party HoneyBadger committee over loopback QUIC runs a submitted `client[0]*client[1]`
+program synced by hash and reveals `375`; a tampered submission is rejected before the runner runs. The
+docker harness `docker/test-submission-endpoint.sh` (compose: `docker-compose.submission.yml`, image
+`docker/submission.Dockerfile`, built with `CC=clang`) runs that test in a container and asserts the
+result + tamper rejection. Wiring the submission TCP server into the long-running `stoffel-run` node
+lifecycle (so a live multi-container committee accepts submissions) is left to W5's packaging work, since
+the monolithic CLI committee construction is not re-runnable per submission without a larger refactor;
+the endpoint API and its end-to-end verification are complete here.
+
 ### W5 — dstack packaging + staging CVM bring-up
 - Node container image (from W1 slim build) + dstack app manifest; N replicas; attestation via W3's
   `DstackAttestor`.

@@ -1,0 +1,25 @@
+# W4 program-submission endpoint integration test (spec task W4).
+#
+# Single-container harness: builds the stoffel-vm test binary with CC=clang and
+# runs the W4 integration test, which exercises a real HoneyBadger committee:
+#   - a client submits a small program to the submission TCP endpoint;
+#   - the committee syncs the program by blake3 hash and runs it;
+#   - the result is returned to the client;
+#   - a tampered program (claimed id != recomputed id) is rejected before any run.
+#
+# Run:
+#   docker compose -f docker-compose.submission.yml up --build
+# or via the wrapper:
+#   ./docker/test-submission-endpoint.sh
+
+services:
+  submission-test:
+    build:
+      context: .
+      dockerfile: docker/submission.Dockerfile
+    container_name: stoffel-w4-submission-test
+    environment:
+      RUST_LOG: info
+      RUST_BACKTRACE: "1"
+    # The image ENTRYPOINT runs the W4 test binary and exits 0 on success.
+    restart: "no"

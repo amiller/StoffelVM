@@ -20,6 +20,7 @@ pub(crate) mod reveal_batcher;
 pub mod session;
 pub(crate) mod share_algebra;
 pub(crate) mod share_runtime;
+pub mod submission;
 
 pub mod avss_engine {
     pub use super::mpc::avss::*;
@@ -170,9 +171,14 @@ pub use program_sync::{
     agree_and_sync_program, program_id_from_bytes, ProgramSyncError, ProgramSyncMessage,
     ProgramSyncResult,
 };
+// Re-export the external program submission endpoint (spec task W4)
 pub use session::{
     agree_session_with_bootnode, derive_instance_id, SessionError, SessionInfo, SessionMessage,
     SessionResult, CONTROL_STREAM_ID, PROGRAM_STREAM_ID,
+};
+pub use submission::{
+    handle_submission, prepare_submission, serve_submission_tcp, submit_tcp, CommitteeRunner,
+    SubmissionError, SubmissionErrorCode, SubmissionOutcome, SubmissionRequest, SubmissionResponse,
 };
 
 #[cfg(test)]

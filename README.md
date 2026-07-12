@@ -479,6 +479,44 @@ The Stoffel source for these programs lives in `crates/stoffel-lang/examples/thr
 
 For the AVSS certificate-signing path, run `/app/programs/avss_certificate_keygen.stflb` with `STOFFEL_MPC_CURVE=secp256k1` or `STOFFEL_MPC_CURVE=p-256` to persist each party's CA signing share. Keygen is idempotent: it loads the existing share if the storage key already exists and only generates on first use. Then run `/app/programs/avss_certificate_sign.stflb` with `STOFFEL_WAIT_FOR_CLIENTS=1`; the client submits the real SHA-256 TBS digest and reconstructs fixed-width threshold ECDSA `r || s` material with `--outputs 2`. The corresponding Stoffel source lives in `crates/stoffel-lang/examples/avss_certificate/keygen/main.stfl` and `crates/stoffel-lang/examples/avss_certificate/sign/main.stfl`.
 
+### Program Submission Endpoint (external program entry)
+
+`stoffel_vm::net::submission` is the thin external entrypoint that lets a client
+hand a compiled MPC program to a node and have a committee run it by content
+hash (spec task W4, `tasks/mpc-node-attestation-spec.md`):
+
+1. `SubmissionRequest { program_bytes, entry, claimed_program_id }` is the
+   external payload; the node computes the `blake3` program id
+   (`program_sync::program_id_from_bytes`).
+2. An optional client-claimed id is validated — a mismatch is a hard
+   `SubmissionError::ProgramTampered` rejection. There is **no error-masking
+   fallback**: a tampered program never reaches the runner.
+3. The bytecode is seeded into the content-addressed program cache
+   (`program_sync`), so every party can fetch it by hash.
+4. A host-supplied `CommitteeRunner` runs `agree_and_sync_program` + the
+   committee run and returns the result; client inputs reuse the existing
+   `client_store` hydration path (no new input mechanism).
+
+`prepare_submission` is the pure core (id + tamper check + cache seed);
+`handle_submission` composes it with a runner; `serve_submission_tcp` /
+`submit_tcp` add a minimal length-prefixed TCP framing so a client can submit to
+one node over the network. The runner — the part that builds and drives an MPC
+committee — is supplied by the host, so the module stays independent of the
+committee-construction code.
+
+The docker harness runs the W4 integration test end-to-end against a real
+HoneyBadger committee over loopback QUIC (no TEE required; build C deps with
+`CC=clang`, see the spec):
+
+```bash
+./docker/test-submission-endpoint.sh
+# equivalently: docker compose -f docker-compose.submission.yml up --build
+```
+
+The test submits a small `client[0] * client[1]` program to the submission TCP
+endpoint, asserts the committee syncs it by hash and reveals `375` (15 × 25),
+and asserts a tampered submission (wrong claimed id) is rejected before any run.
+
 ## C Foreign Function Interface
 
 `stoffel-vm` builds as both an `rlib` and a `cdylib`, so the runtime can also be embedded from C-compatible environments.
