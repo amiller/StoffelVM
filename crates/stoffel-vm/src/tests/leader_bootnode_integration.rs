@@ -722,3 +722,273 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
         n_parties
     );
 }
+
+// =============================================================================
+// W3: Attestation-gated committee admission
+// =============================================================================
+//
+// Extends the bootnode admission seam (crates/stoffel-vm/src/net/discovery.rs)
+// so a MockAttestor peer presenting a bad/unlisted TEE measurement is refused
+// and the committee forms only from good-measurement peers. Mirrors the
+// real-QUIC + bootnode pattern used by the discovery unit tests so the full
+// admission path (RegisterWithSession -> auth token -> attestation gate ->
+// pending session -> SessionAnnounce) is exercised end to end.
+
+#[cfg(test)]
+mod attestation_admission {
+    use super::*;
+    use crate::net::attestation::{AdmissionAttestation, Measurement, MockAttestor};
+    use crate::net::discovery::run_bootnode_with_config_and_attestation;
+    use crate::net::session::SessionMessage;
+    use stoffelnet::network_utils::PartyId;
+    use stoffelnet::transports::quic::{NetworkManager, PeerConnection, QuicNetworkManager};
+    use tokio::time::{sleep, timeout};
+
+    /// Expected image measurement trusted by the bootnode allowlist.
+    const GOOD_MEASUREMENT: Measurement = [0x42u8; 32];
+    /// Untrusted measurement presented by the malicious peer.
+    const BAD_MEASUREMENT: Measurement = [0x00u8; 32];
+    /// Shared mock-attestor key; bootnode and all honest evidence minters use it.
+    const ATTESTOR_KEY: [u8; 32] = [0xABu8; 32];
+
+    fn reserve_local_addr() -> SocketAddr {
+        use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .expect("bind UDP socket on localhost");
+        socket.local_addr().expect("get local socket address")
+    }
+
+    async fn send_ctrl(conn: &dyn PeerConnection, msg: &crate::net::discovery::DiscoveryMessage) {
+        let bytes = bincode::serialize(msg).expect("serialize discovery message");
+        conn.send(bytes.as_slice())
+            .await
+            .expect("send discovery message");
+    }
+
+    /// Read the next discovery/session message the bootnode sends on this conn.
+    async fn recv_raw(conn: &dyn PeerConnection) -> Vec<u8> {
+        timeout(Duration::from_secs(5), conn.receive())
+            .await
+            .expect("timed out waiting for bootnode response")
+            .expect("receive bootnode response")
+    }
+
+    /// A good peer: valid auth token, GOOD_MEASUREMENT evidence bound to its
+    /// real TLS-derived id. Must be admitted.
+    async fn register_good_peer(
+        bootnode_addr: SocketAddr,
+        party_id: usize,
+        listen_addr: SocketAddr,
+        program_id: [u8; 32],
+        auth_token: &str,
+    ) -> (Arc<dyn PeerConnection>, PartyId, SocketAddr) {
+        let mut net = QuicNetworkManager::new();
+        let conn = net
+            .connect(bootnode_addr)
+            .await
+            .expect("good peer connects");
+        let tls_id = net.local_derived_id();
+        let evidence = MockAttestor::new(ATTESTOR_KEY).generate(GOOD_MEASUREMENT, tls_id);
+        send_ctrl(
+            &*conn,
+            &crate::net::discovery::DiscoveryMessage::RegisterWithSession {
+                party_id,
+                listen_addr,
+                program_id,
+                entry: "main".to_string(),
+                n_parties: 2,
+                threshold: 1,
+                program_bytes: None,
+                auth_token: Some(auth_token.to_string()),
+                tls_derived_id: Some(tls_id),
+                attestation: Some(evidence),
+            },
+        )
+        .await;
+        // Keep the manager alive for the test duration (the conn borrows its endpoint).
+        std::mem::forget(net);
+        (conn, tls_id, listen_addr)
+    }
+
+    /// Bootnode with attestation admission: Mock attestor, allowlist =
+    /// [GOOD_MEASUREMENT], expected 2 parties. The malicious peer is rejected
+    /// and the two good peers form the committee.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attestation_gate_refuses_bad_measurement_peer() {
+        crate::tests::test_utils::init_crypto_provider();
+        crate::tests::test_utils::setup_test_tracing();
+
+        // No env attestation: we configure programmatically.
+        let bootnode_addr = reserve_local_addr();
+        let admission = AdmissionAttestation::new_mock(ATTESTOR_KEY, vec![GOOD_MEASUREMENT]);
+        let auth_token = "attest-secret".to_string();
+        let bootnode = tokio::spawn(run_bootnode_with_config_and_attestation(
+            bootnode_addr,
+            Some(2),
+            Some(auth_token.clone()),
+            Some(admission),
+        ));
+        // Give the bootnode a moment to listen.
+        sleep(Duration::from_millis(150)).await;
+
+        let program_id = [0x11u8; 32];
+
+        // Good peer 0 registers (1/2).
+        let good0_addr = reserve_local_addr();
+        let (good0_conn, good0_tls, _) =
+            register_good_peer(bootnode_addr, 0, good0_addr, program_id, &auth_token).await;
+
+        // Malicious peer registers with BAD_MEASUREMENT evidence -> must be refused.
+        let bad_addr = reserve_local_addr();
+        let mut bad_net = QuicNetworkManager::new();
+        let bad_conn = bad_net
+            .connect(bootnode_addr)
+            .await
+            .expect("bad peer connects");
+        let bad_tls = bad_net.local_derived_id();
+        let bad_evidence = MockAttestor::new(ATTESTOR_KEY).generate(BAD_MEASUREMENT, bad_tls);
+        send_ctrl(
+            &*bad_conn,
+            &crate::net::discovery::DiscoveryMessage::RegisterWithSession {
+                party_id: 2,
+                listen_addr: bad_addr,
+                program_id,
+                entry: "main".to_string(),
+                n_parties: 2,
+                threshold: 1,
+                program_bytes: None,
+                auth_token: Some(auth_token.clone()),
+                tls_derived_id: Some(bad_tls),
+                attestation: Some(bad_evidence),
+            },
+        )
+        .await;
+        std::mem::forget(bad_net);
+
+        // The bad peer must be REFUSED: it receives PeerLeft, never SessionAnnounce.
+        let bad_buf = recv_raw(&*bad_conn).await;
+        let bad_msg = bincode::deserialize::<crate::net::discovery::DiscoveryMessage>(&bad_buf)
+            .expect("deserialize bad-peer response");
+        assert!(
+            matches!(
+                bad_msg,
+                crate::net::discovery::DiscoveryMessage::PeerLeft { party_id: 2 }
+            ),
+            "bad-measurement peer must be refused (PeerLeft), got {:?}",
+            bad_msg
+        );
+
+        // Good peer 1 registers (2/2) -> session becomes ready and both good
+        // peers receive SessionAnnounce.
+        let good1_addr = reserve_local_addr();
+        let (good1_conn, good1_tls, _) =
+            register_good_peer(bootnode_addr, 1, good1_addr, program_id, &auth_token).await;
+
+        // Both good peers must receive a SessionAnnounce whose party list is
+        // EXACTLY {good0, good1} and which excludes the malicious peer.
+        for (label, conn) in [("good0", &good0_conn), ("good1", &good1_conn)] {
+            let buf = recv_raw(&**conn).await;
+            let info = match bincode::deserialize::<SessionMessage>(&buf)
+                .expect("deserialize session message")
+            {
+                SessionMessage::SessionAnnounce(info) => info,
+                other => panic!("[{label}] expected SessionAnnounce, got {:?}", other),
+            };
+            assert_eq!(
+                info.parties.len(),
+                2,
+                "[{label}] committee must form only from good peers (2), got {}",
+                info.parties.len()
+            );
+            let addresses: Vec<SocketAddr> = info.parties.iter().map(|(_, a)| *a).collect();
+            assert!(
+                addresses.contains(&good0_addr),
+                "[{label}] committee missing good0"
+            );
+            assert!(
+                addresses.contains(&good1_addr),
+                "[{label}] committee missing good1"
+            );
+            assert!(
+                !addresses.contains(&bad_addr),
+                "[{label}] bad-measurement peer must NOT be admitted to the committee"
+            );
+            // TLS-derived IDs of admitted peers must be present and correct.
+            let tls_map: std::collections::HashMap<PartyId, PartyId> =
+                info.tls_ids.iter().copied().collect();
+            assert_eq!(tls_map.get(&0), Some(&good0_tls), "[{label}] good0 tls id");
+            assert_eq!(tls_map.get(&1), Some(&good1_tls), "[{label}] good1 tls id");
+            assert!(
+                !info.tls_ids.iter().any(|(_, t)| *t == bad_tls),
+                "[{label}] bad peer tls id must not appear"
+            );
+        }
+
+        bootnode.abort();
+        let _ = bootnode.await;
+    }
+
+    /// A peer with a GOOD measurement but whose quote is bound to a *different*
+    /// cert than its presented `tls_derived_id` (impersonation / replay) must
+    /// also be refused — the cert binding is enforced at admission.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attestation_gate_refuses_cert_binding_mismatch() {
+        crate::tests::test_utils::init_crypto_provider();
+        crate::tests::test_utils::setup_test_tracing();
+
+        let bootnode_addr = reserve_local_addr();
+        let admission = AdmissionAttestation::new_mock(ATTESTOR_KEY, vec![GOOD_MEASUREMENT]);
+        let auth_token = "attest-secret".to_string();
+        let bootnode = tokio::spawn(run_bootnode_with_config_and_attestation(
+            bootnode_addr,
+            Some(1),
+            Some(auth_token.clone()),
+            Some(admission),
+        ));
+        sleep(Duration::from_millis(150)).await;
+
+        let program_id = [0x22u8; 32];
+
+        // Impostor presents tls_derived_id = 1111 but a quote bound to cert 9999.
+        let impostor_addr = reserve_local_addr();
+        let mut net = QuicNetworkManager::new();
+        let conn = net.connect(bootnode_addr).await.expect("impostor connects");
+        let impostor_presented_tls: PartyId = 1111;
+        let bound_cert: PartyId = 9999; // quote genuinely binds a *different* cert
+        let evidence = MockAttestor::new(ATTESTOR_KEY).generate(GOOD_MEASUREMENT, bound_cert);
+        send_ctrl(
+            &*conn,
+            &crate::net::discovery::DiscoveryMessage::RegisterWithSession {
+                party_id: 5,
+                listen_addr: impostor_addr,
+                program_id,
+                entry: "main".to_string(),
+                n_parties: 1,
+                threshold: 0,
+                program_bytes: None,
+                auth_token: Some(auth_token.clone()),
+                tls_derived_id: Some(impostor_presented_tls),
+                attestation: Some(evidence),
+            },
+        )
+        .await;
+        std::mem::forget(net);
+
+        // Impostor must be refused (PeerLeft), and because it is the only
+        // would-be party the session never forms (no SessionAnnounce).
+        let buf = recv_raw(&*conn).await;
+        let msg = bincode::deserialize::<crate::net::discovery::DiscoveryMessage>(&buf)
+            .expect("deserialize response");
+        assert!(
+            matches!(
+                msg,
+                crate::net::discovery::DiscoveryMessage::PeerLeft { party_id: 5 }
+            ),
+            "cert-binding mismatch must be refused (PeerLeft), got {:?}",
+            msg
+        );
+
+        bootnode.abort();
+        let _ = bootnode.await;
+    }
+}

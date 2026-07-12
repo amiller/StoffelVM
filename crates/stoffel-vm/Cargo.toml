@@ -71,6 +71,11 @@ default = []
 hb_itest = []
 avss_itest = []
 nat = []
+# Real Intel TDX quote verification via dstack. When this feature is OFF,
+# `DstackAttestor` does not exist and dstack evidence cannot be verified
+# (configuring dstack mode is a build-time error). When ON but the SDK is not
+# yet wired, `DstackAttestor::verify` returns an explicit error — never admit.
+attestation-dstack = []
 
 [dev-dependencies]
 criterion = { version = "0.6.0", features = ["html_reports"] }

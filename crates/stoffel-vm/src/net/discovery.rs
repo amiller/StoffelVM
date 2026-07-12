@@ -2,6 +2,9 @@
 //! Supports both direct connections and NAT traversal via ICE hole punching.
 mod bootnode;
 
+use super::attestation::{
+    attestation_admission_from_env, AdmissionAttestation, AttestationEvidence,
+};
 use super::session::{SessionInfo, SessionMessage};
 use bincode;
 use bootnode::{spawn_connection_handler, BootnodeState};
@@ -88,6 +91,12 @@ pub enum DiscoveryMessage {
         /// TLS-derived identity (hash of certificate public key) so peers can
         /// pre-register this party in their allowlist before accept().
         tls_derived_id: Option<PartyId>,
+        /// Hardware attestation evidence binding this peer's TEE measurement
+        /// to `tls_derived_id`. Required when the bootnode has attestation
+        /// admission enabled; ignored (and typically `None`) otherwise. See
+        /// `net::attestation`.
+        #[serde(default)]
+        attestation: Option<AttestationEvidence>,
     },
     /// Request to fetch program bytes from bootnode
     ProgramFetchRequest {
@@ -172,26 +181,59 @@ pub async fn run_bootnode(bind: SocketAddr) -> Result<(), String> {
 /// Run bootnode with optional expected party count for session management.
 /// If n_parties is Some, bootnode will wait for exactly that many parties before
 /// announcing the session. If None, uses the n_parties from first RegisterWithSession.
+///
+/// Attestation admission is configured from the environment (additive): when
+/// `STOFFEL_ATTESTATION_MODE` is unset/`disabled`, attestation is off and the
+/// existing `STOFFEL_AUTH_TOKEN` admission path is unchanged.
 pub async fn run_bootnode_with_config(
     bind: SocketAddr,
     expected_parties: Option<usize>,
 ) -> Result<(), String> {
     let required_auth_token = required_discovery_auth_token("bootnode discovery registration")?;
     eprintln!("[bootnode] Discovery registration authentication enabled");
-    run_bootnode_with_config_and_auth(bind, expected_parties, Some(required_auth_token)).await
+    let attestation = attestation_admission_from_env()?;
+    if let Some(ref adm) = attestation {
+        eprintln!(
+            "[bootnode] Attestation admission enabled (attestor={:?}, allowlist={})",
+            adm.kind(),
+            adm.allowed_measurements_len()
+        );
+    }
+    run_bootnode_with_config_and_attestation(
+        bind,
+        expected_parties,
+        Some(required_auth_token),
+        attestation,
+    )
+    .await
 }
 
+/// Bootnode with explicit auth token and no attestation (legacy/tests).
+#[cfg(test)]
 async fn run_bootnode_with_config_and_auth(
     bind: SocketAddr,
     expected_parties: Option<usize>,
     required_auth_token: Option<String>,
+) -> Result<(), String> {
+    run_bootnode_with_config_and_attestation(bind, expected_parties, required_auth_token, None)
+        .await
+}
+
+/// Run bootnode with explicit auth token and attestation admission policy.
+/// This is the fully-configured entry point; the other `run_bootnode*` helpers
+/// delegate here with attestation disabled.
+pub(crate) async fn run_bootnode_with_config_and_attestation(
+    bind: SocketAddr,
+    expected_parties: Option<usize>,
+    required_auth_token: Option<String>,
+    attestation: Option<AdmissionAttestation>,
 ) -> Result<(), String> {
     let mut net = QuicNetworkManager::with_config(QuicNetworkConfig {
         use_tls: false,
         ..Default::default()
     });
     net.listen(bind).await?;
-    let state = BootnodeState::new(expected_parties);
+    let state = BootnodeState::new_with_attestation(expected_parties, attestation);
 
     eprintln!("[bootnode] Listening on {}", bind);
 
@@ -609,11 +651,22 @@ pub struct SessionRegistrationConfig {
     pub threshold: usize,
     pub timeout: Duration,
     pub program_bytes: Option<Vec<u8>>,
+    /// Hardware attestation evidence binding this party's TEE measurement to
+    /// its TLS cert. Leave `None` when the bootnode has attestation disabled;
+    /// the bootnode rejects registrations that lack evidence while
+    /// attestation is enabled. See `net::attestation`.
+    pub attestation: Option<AttestationEvidence>,
 }
 
 impl SessionRegistrationConfig {
     pub fn with_program_bytes(mut self, program_bytes: Vec<u8>) -> Self {
         self.program_bytes = Some(program_bytes);
+        self
+    }
+
+    /// Attach attestation evidence to this registration.
+    pub fn with_attestation(mut self, attestation: AttestationEvidence) -> Self {
+        self.attestation = Some(attestation);
         self
     }
 }
@@ -644,6 +697,7 @@ pub async fn register_and_wait_for_session(
         threshold,
         timeout,
         program_bytes,
+        attestation,
     } = config;
     let uploading_program = program_bytes.is_some();
 
@@ -680,6 +734,7 @@ pub async fn register_and_wait_for_session(
         program_bytes,
         auth_token: Some(auth_token),
         tls_derived_id: Some(local_tls_id),
+        attestation,
     };
     let send_start = tokio::time::Instant::now();
     send_ctrl(&*bn_conn, &reg_msg)
@@ -1137,6 +1192,7 @@ mod tests {
                 program_bytes: None,
                 auth_token: Some(auth_token.clone()),
                 tls_derived_id: None,
+                attestation: None,
             },
         )
         .await
@@ -1159,6 +1215,7 @@ mod tests {
                 program_bytes: None,
                 auth_token: Some("bad-token".to_string()),
                 tls_derived_id: None,
+                attestation: None,
             },
         )
         .await
@@ -1181,6 +1238,7 @@ mod tests {
                 program_bytes: None,
                 auth_token: Some(auth_token),
                 tls_derived_id: None,
+                attestation: None,
             },
         )
         .await

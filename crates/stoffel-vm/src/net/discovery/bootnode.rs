@@ -1,4 +1,5 @@
 use super::{registration_token_is_valid, send_ctrl, send_session_announce, DiscoveryMessage};
+use crate::net::attestation::{AdmissionAttestation, AttestationError, AttestationEvidence};
 use crate::net::{
     program_sync::{send_ctrl as send_prog_ctrl, send_program_bytes, ProgramSyncMessage},
     session::{derive_instance_id, random_instance_id, SessionInfo, SessionMessage},
@@ -28,6 +29,10 @@ pub(super) struct SessionRegistration {
     pub n_parties: usize,
     pub threshold: usize,
     pub tls_derived_id: Option<PartyId>,
+    /// Hardware attestation evidence presented by the registrant. Verified by
+    /// `BootnodeState::verify_attestation` before the party is admitted to the
+    /// pending session. `None` is rejected when attestation admission is on.
+    pub attestation: Option<AttestationEvidence>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +63,12 @@ pub(super) struct BootnodeState {
     expected_parties: Option<usize>,
     session_tx: watch::Sender<Option<SessionInfo>>,
     ice_tx: broadcast::Sender<DiscoveryMessage>,
+    /// Attestation admission policy. `None` = disabled (existing
+    /// `STOFFEL_AUTH_TOKEN` admission path is unchanged). `Some` = every
+    /// `RegisterWithSession` must present evidence that verifies and whose
+    /// measurement is allowlisted and whose cert binds the presented
+    /// `tls_derived_id`.
+    attestation: Option<Arc<AdmissionAttestation>>,
 }
 
 #[derive(Clone)]
@@ -67,7 +78,17 @@ struct CachedProgram {
 }
 
 impl BootnodeState {
+    #[cfg(test)]
     pub fn new(expected_parties: Option<usize>) -> Self {
+        Self::new_with_attestation(expected_parties, None)
+    }
+
+    /// Construct with an attestation admission policy. `attestation = None`
+    /// disables attestation (legacy behavior).
+    pub fn new_with_attestation(
+        expected_parties: Option<usize>,
+        attestation: Option<AdmissionAttestation>,
+    ) -> Self {
         let (session_tx, _session_rx) = watch::channel(None);
         let (ice_tx, _ice_rx) = broadcast::channel(256);
         Self {
@@ -78,6 +99,32 @@ impl BootnodeState {
             expected_parties,
             session_tx,
             ice_tx,
+            attestation: attestation.map(Arc::new),
+        }
+    }
+
+    /// Returns true when attestation admission is enabled.
+    pub fn attestation_enabled(&self) -> bool {
+        self.attestation.is_some()
+    }
+
+    /// Verify a registrant's attestation evidence against this bootnode's
+    /// admission policy. When attestation is disabled this is a no-op pass
+    /// (`Ok(None)`); otherwise it runs the full fail-closed check (quote valid,
+    /// measurement allowlisted, cert bound to `tls_derived_id`).
+    ///
+    /// Returns `Ok(Some(cert_hash))` on successful attested admission, and
+    /// `Ok(None)` when attestation is disabled.
+    pub fn verify_attestation(
+        &self,
+        evidence: Option<&AttestationEvidence>,
+        tls_derived_id: Option<PartyId>,
+    ) -> Result<Option<PartyId>, AttestationError> {
+        match &self.attestation {
+            None => Ok(None),
+            Some(admission) => admission
+                .verify_registration(evidence, tls_derived_id)
+                .map(Some),
         }
     }
 
@@ -379,6 +426,7 @@ impl BootnodeConnection {
                 program_bytes,
                 auth_token,
                 tls_derived_id,
+                attestation,
             } => {
                 let registration = SessionRegistration {
                     party_id,
@@ -388,6 +436,7 @@ impl BootnodeConnection {
                     n_parties,
                     threshold,
                     tls_derived_id,
+                    attestation,
                 };
                 self.handle_session_registration(registration, program_bytes, auth_token)
                     .await;
@@ -534,13 +583,33 @@ impl BootnodeConnection {
             return;
         }
 
+        // Attestation admission gate (additive). When enabled, verify the
+        // registrant's TEE evidence: quote valid, measurement allowlisted, and
+        // the quote's bound cert equals the presented `tls_derived_id`. Fail
+        // closed: a missing/invalid/wrong-kind quote, an unlisted measurement,
+        // or a cert-binding mismatch all reject the registration without
+        // admitting the peer. When disabled, this is a no-op pass.
+        if let Err(err) = self.state.verify_attestation(
+            registration.attestation.as_ref(),
+            registration.tls_derived_id,
+        ) {
+            eprintln!(
+                "[bootnode] Rejected RegisterWithSession from party {} (attestation: {})",
+                party_id, err
+            );
+            let _ = send_ctrl(&*self.conn, &DiscoveryMessage::PeerLeft { party_id }).await;
+            self.waiting_for_session = false;
+            return;
+        }
+
         eprintln!(
-            "[bootnode] Party {} registering for session (program: {}, n={}, t={}, has_bytes={})",
+            "[bootnode] Party {} registering for session (program: {}, n={}, t={}, has_bytes={}, attestation={})",
             party_id,
             hex::encode(&registration.program_id[..8]),
             registration.n_parties,
             registration.threshold,
-            program_bytes.is_some()
+            program_bytes.is_some(),
+            if self.state.attestation_enabled() { "on" } else { "off" }
         );
 
         if let Some(bytes) = program_bytes {
@@ -738,6 +807,7 @@ mod tests {
             n_parties: 2,
             threshold: 1,
             tls_derived_id: Some(100 + party_id),
+            attestation: None,
         }
     }
 

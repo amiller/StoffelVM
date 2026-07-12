@@ -4272,6 +4272,7 @@ async fn main() {
                 threshold: t,
                 timeout: session_registration_timeout(),
                 program_bytes,
+                attestation: None, // TODO(W5): present real/mock attestation evidence here.
             },
         )
         .await
@@ -4367,6 +4368,7 @@ async fn main() {
                 threshold: t,
                 timeout: session_registration_timeout(),
                 program_bytes,
+                attestation: None, // TODO(W5): present real/mock attestation evidence here.
             },
         )
         .await

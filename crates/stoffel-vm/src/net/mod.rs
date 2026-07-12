@@ -1,6 +1,7 @@
 // src/net/mod.rs
 //! Networking module for peer-to-peer communication.
 
+pub mod attestation;
 pub mod avss_server;
 pub(crate) mod broadcast;
 pub mod client_store;
