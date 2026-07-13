@@ -1,0 +1,69 @@
+# dstack app manifest for the attestation-gated Stoffel MPC committee.
+#
+# This is the dstack application definition (Docker Compose format; dstack
+# measures this file into `compose_hash`, which feeds the TEE runtime
+# measurement). Each staging CVM runs this compose; the Stoffel committee is N
+# such CVMs (1 leader running the bootnode + party 0, and N-1 parties), all
+# admitted to each other only after W3/W5 attestation against the expected
+# image measurement.
+#
+# Bring-up (staging CVMs with real TDX): see dstack/README.md. In short:
+#   1. docker build -f docker/dstack.Dockerfile -t stoffel-dstack-node:dev .
+#   2. Capture the expected measurement from one booted instance
+#      (stoffel-dstack-measurement, or read the bootnode attestation log).
+#   3. Set STOFFEL_ATTESTATION_ALLOWED_MEASUREMENTS=<that hex> and launch N
+#      replicas with dstack, role-splitting leader vs party.
+#
+# The dstack device manager exposes the TDX quote service at /var/run/dstack.sock
+# inside the CVM; bind-mounting it is what lets the node call `GetQuote`.
+
+services:
+  stoffel-node:
+    image: stoffel-dstack-node:dev
+    restart: unless-stopped
+    # The node reads its role and committee topology from env; the staging
+    # orchestrator sets these per replica (leader vs party).
+    environment:
+      STOFFEL_ROLE: ${STOFFEL_ROLE:-leader}
+      STOFFEL_PARTY_ID: ${STOFFEL_PARTY_ID:-0}
+      STOFFEL_N_PARTIES: ${STOFFEL_N_PARTIES:-3}
+      STOFFEL_THRESHOLD: ${STOFFEL_THRESHOLD:-1}
+      STOFFEL_BIND_ADDR: "0.0.0.0:9000"
+      # Leader's discovery address, as reachable from each party CVM. Set per
+      # deployment (e.g. the leader CVM's private/address).
+      STOFFEL_BOOTSTRAP_ADDR: ${STOFFEL_BOOTSTRAP_ADDR:-}
+      STOFFEL_PROGRAM: ${STOFFEL_PROGRAM:-/app/programs/program.stflb}
+      STOFFEL_ENTRY: ${STOFFEL_ENTRY:-main}
+      STOFFEL_AUTH_TOKEN: ${STOFFEL_AUTH_TOKEN:?STOFFEL_AUTH_TOKEN must be set}
+      # W3/W5 attestation admission gate (real TDX). The allowlist pins the
+      # expected image measurement; a wrong/tampered image is refused admission.
+      STOFFEL_ATTESTATION_MODE: dstack
+      STOFFEL_ATTESTATION_ALLOWED_MEASUREMENTS: ${STOFFEL_ATTESTATION_ALLOWED_MEASUREMENTS:?expected image measurement must be pinned}
+      STOFFEL_DSTACK_PCCS_URL: ${STOFFEL_DSTACK_PCCS_URL:-https://pccs.phala.network}
+      RUST_LOG: ${RUST_LOG:-stoffel::attestation=info,info}
+    ports:
+      - "9000:9000"    # bootnode coordination (leader)
+      - "10000:10000"  # party-to-party MPC traffic
+      - "16180:16180"  # node RPC / submission endpoint (W4)
+    # dstack device manager socket: required for the node to obtain its TDX
+    # quote (`obtain_dstack_evidence`). Absent outside a real CVM, in which case
+    # the node exits (fail-closed) rather than register without evidence.
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    # Content-addressed program cache + preprocessing store survive restarts
+    # (W2 persistence) and are per-instance under /data.
+    volumes_from:
+      - stoffel-data
+    depends_on:
+      - stoffel-data
+
+  # Persistent per-instance state: program cache (program_sync) + LMDB
+  # preprocessing store + reservation snapshot (W2). dstack provisions this.
+  stoffel-data:
+    image: busybox:1.36
+    command: ["sh", "-c", "mkdir -p /data/programs /data/preproc && sleep infinity"]
+    volumes:
+      - stoffel-data:/data
+
+volumes:
+  stoffel-data:

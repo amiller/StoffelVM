@@ -66,6 +66,14 @@ sha2 = "0.10"
 ed25519-dalek = { version = "2", features = ["std"] }
 curve25519-dalek = { version = "4", features = ["alloc"] }
 
+# Real Intel TDX quote verification via dstack (spec task W5). Optional; pulled
+# in only by the `attestation-dstack` feature. `dcap-qvl` performs the pure-Rust
+# DCAP/TDX quote verification (signature chain against the Intel root of trust)
+# and the PCCS collateral fetch; `serde_json` is used by the minimal inline
+# dstack JSON-RPC client (`obtain_dstack_evidence`) that reads `/var/run/dstack.sock`.
+dcap-qvl = { version = "0.5.2", default-features = false, features = ["std", "rustcrypto", "default-x509", "report"], optional = true }
+serde_json = { version = "1.0", optional = true }
+
 [features]
 default = []
 hb_itest = []
@@ -73,12 +81,24 @@ avss_itest = []
 nat = []
 # Real Intel TDX quote verification via dstack. When this feature is OFF,
 # `DstackAttestor` does not exist and dstack evidence cannot be verified
-# (configuring dstack mode is a build-time error). When ON but the SDK is not
-# yet wired, `DstackAttestor::verify` returns an explicit error — never admit.
-attestation-dstack = []
+# (configuring dstack mode is a build-time error). When ON, `DstackAttestor::verify`
+# verifies a real TDX quote against the Intel root of trust via `dcap-qvl` and
+# extracts the measurement + cert binding — it never admits an unverifiable quote.
+attestation-dstack = ["dep:dcap-qvl", "dep:serde_json"]
 
 [dev-dependencies]
 criterion = { version = "0.6.0", features = ["html_reports"] }
+# Used by the `attestation-dstack` test helper that pins a verification time
+# inside a DCAP collateral validity window. Already in the dep tree (via
+# dcap-qvl/rustls); listed here so the test can name it directly.
+chrono = "0.4"
+# Used by the `attestation-dstack` test helper `now_in_collateral_window` to
+# parse CRL DER + cert DER validity windows. Already in the dep tree (via
+# dcap-qvl); listed here so the test can name them directly.
+der = "0.7"
+x509-cert = "0.2"
+pem = "3"
+parity-scale-codec = "3.7"
 k256 = { version = "0.13", features = ["ecdsa"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
 # Test-only (core_vm/tests.rs, tests/aes_count.rs) — all compiled under cfg(test)/dev-deps.

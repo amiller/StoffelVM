@@ -14,6 +14,13 @@ publish = true
 name = "stoffel-run"
 path = "src/bin/stoffel-run.rs"
 
+# Captures a node image's TDX attestation measurement from a running dstack CVM,
+# for pinning as STOFFEL_ATTESTATION_ALLOWED_MEASUREMENTS. Only meaningful under
+# the attestation-dstack feature (prints a clear error otherwise).
+[[bin]]
+name = "stoffel-dstack-measurement"
+path = "src/bin/stoffel-dstack-measurement.rs"
+
 [dependencies]
 stoffel-vm = { version = "0.1.1", path = "../stoffel-vm" }
 stoffel-vm-types = { version = "0.1.1", path = "../stoffel-vm-types" }
@@ -43,6 +50,13 @@ tokio = { version = "1.47.1", features = ["full"] }
 tracing = "0.1.41"
 uuid = { version = "1.17.0", features = ["v4"] }
 x509-parser = "0.18.1"
+
+[features]
+# Forward to the VM crate so the dstack node image can be built with
+# `--features attestation-dstack` (real Intel TDX quote verification).
+# When OFF, requesting STOFFEL_ATTESTATION_MODE=dstack at runtime is a hard
+# error (the node exits rather than register without evidence).
+attestation-dstack = ["stoffel-vm/attestation-dstack"]
 
 [dev-dependencies]
 stoffel-vm-types = { version = "0.1.1", path = "../stoffel-vm-types" }

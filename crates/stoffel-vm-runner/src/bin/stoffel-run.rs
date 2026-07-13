@@ -28,6 +28,7 @@ use stoffel_vm::net::{
     program_id_from_bytes, register_and_wait_for_session, run_bootnode_with_config,
     SessionRegistrationConfig,
 };
+use stoffel_vm::net::attestation::AttestationEvidence;
 use stoffel_vm::net::{MpcBackendKind, MpcCurveConfig};
 use stoffel_vm::runtime_hooks::{HookContext, HookEvent};
 use stoffel_vm::storage::preproc::LmdbPreprocStore;
@@ -204,6 +205,75 @@ fn session_registration_timeout() -> Duration {
         .filter(|value| *value > 0)
         .unwrap_or(120);
     Duration::from_secs(seconds)
+}
+
+/// Read `STOFFEL_ATTESTATION_MODE` and, when it selects dstack (real Intel TDX
+/// attestation), obtain a [`AttestationEvidence`] bound to this node's TLS
+/// identity so the bootnode's admission gate can verify it (spec task W5).
+///
+/// Fail-closed contract (mirrors the W3 admission layer): if the operator asks
+/// for dstack attestation but the binary was built without the
+/// `attestation-dstack` feature, or the dstack device-manager socket is not
+/// reachable (i.e. we are not inside a TEE), the node **exits** rather than
+/// register without evidence. Registering without evidence under an attesting
+/// bootnode would just be refused anyway; failing fast gives a clear error.
+///
+/// `mock` attestation is CI-only (exercised by the in-process tests) and is not
+/// wired into the node binary; requesting it is treated as misconfiguration.
+async fn registration_attestation(
+    tls_derived_id: stoffelnet::network_utils::PartyId,
+) -> Option<AttestationEvidence> {
+    // `tls_derived_id` is only consumed in the `dstack` arm under the
+    // `attestation-dstack` feature; reference it once so the no-feature build
+    // does not warn (the value is still used verbatim under the feature).
+    let _ = &tls_derived_id;
+    let mode = env::var("STOFFEL_ATTESTATION_MODE")
+        .ok()
+        .map(|m| m.trim().to_ascii_lowercase())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| "disabled".to_string());
+    match mode.as_str() {
+        "disabled" | "off" | "none" => None,
+        "dstack" => {
+            #[cfg(feature = "attestation-dstack")]
+            {
+                eprintln!(
+                    "[party] STOFFEL_ATTESTATION_MODE=dstack: obtaining TDX quote bound to tls_derived_id={tls_derived_id}"
+                );
+                match stoffel_vm::net::attestation::obtain_dstack_evidence(tls_derived_id).await {
+                    Ok(evidence) => {
+                        eprintln!("[party] obtained dstack TDX attestation evidence");
+                        return Some(evidence);
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "FATAL: STOFFEL_ATTESTATION_MODE=dstack but attestation evidence could not be obtained: {error}"
+                        );
+                        exit(13);
+                    }
+                }
+            }
+            #[cfg(not(feature = "attestation-dstack"))]
+            {
+                eprintln!(
+                    "FATAL: STOFFEL_ATTESTATION_MODE=dstack but this binary was built WITHOUT the attestation-dstack cargo feature; rebuild with --features attestation-dstack"
+                );
+                exit(13);
+            }
+        }
+        "mock" => {
+            eprintln!(
+                "FATAL: STOFFEL_ATTESTATION_MODE=mock is CI-only (exercised by in-process tests) and is not wired into the node binary; use dstack or disabled"
+            );
+            exit(13);
+        }
+        other => {
+            eprintln!(
+                "FATAL: unknown STOFFEL_ATTESTATION_MODE={other:?}; expected disabled|dstack"
+            );
+            exit(13);
+        }
+    }
 }
 
 fn extract_pubkey_from_cert(cert_der: &[u8]) -> Vec<u8> {
@@ -4260,6 +4330,11 @@ async fn main() {
         } else {
             None
         };
+        // W5: when attestation is enabled, obtain a TDX quote bound to this
+        // node's TLS identity and present it so the bootnode admission gate can
+        // verify it before this peer is admitted. Fail-closed: the helper exits
+        // the process if evidence is required but cannot be obtained.
+        let attestation = registration_attestation(mgr.local_derived_id()).await;
         let session_info = match register_and_wait_for_session(
             &mut mgr,
             SessionRegistrationConfig {
@@ -4272,7 +4347,7 @@ async fn main() {
                 threshold: t,
                 timeout: session_registration_timeout(),
                 program_bytes,
-                attestation: None, // TODO(W5): present real/mock attestation evidence here.
+                attestation,
             },
         )
         .await
@@ -4356,6 +4431,9 @@ async fn main() {
         } else {
             None
         };
+        // W5: obtain attestation evidence bound to this node's TLS identity when
+        // attestation is enabled (fail-closed; see `registration_attestation`).
+        let attestation = registration_attestation(mgr.local_derived_id()).await;
         let session_info = match register_and_wait_for_session(
             &mut mgr,
             SessionRegistrationConfig {
@@ -4368,7 +4446,7 @@ async fn main() {
                 threshold: t,
                 timeout: session_registration_timeout(),
                 program_bytes,
-                attestation: None, // TODO(W5): present real/mock attestation evidence here.
+                attestation,
             },
         )
         .await

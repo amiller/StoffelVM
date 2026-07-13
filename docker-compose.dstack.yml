@@ -1,0 +1,28 @@
+# W5 dstack real-TDX attestation verification (spec task W5).
+#
+# Single-container harness that proves the W3 DstackAttestor is genuinely wired
+# to real Intel TDX quote verification: it runs the attestation unit tests
+# against a real, Intel-issued TDX quote + DCAP collateral vector (vendored
+# under crates/stoffel-vm/src/tests/fixtures/dstack/), with RUST_LOG surfacing
+# the measurement-match log line.
+#
+# This is the CI-runnable artifact for "capture attestation logs showing
+# measurement match" — no TEE hardware required, because it verifies a recorded
+# real TDX quote rather than minting a fresh one.
+#
+# Run:
+#   docker compose -f docker-compose.dstack.yml up --build
+# or via the wrapper:
+#   ./docker/test-dstack-attestation.sh
+
+services:
+  dstack-attestation-test:
+    build:
+      context: .
+      dockerfile: docker/dstack-attestation-test.Dockerfile
+    container_name: stoffel-w5-dstack-attestation-test
+    environment:
+      # Surface the measurement-match log line from verify_dstack_quote.
+      RUST_LOG: "stoffel::attestation=info"
+      RUST_BACKTRACE: "1"
+    restart: "no"

@@ -32,6 +32,12 @@ use serde::{Deserialize, Serialize};
 use stoffelnet::network_utils::PartyId;
 use thiserror::Error;
 
+// Real Intel TDX quote verification (spec task W5). Only compiled when the
+// `attestation-dstack` feature is on; the rest of the crate is independent of
+// the DCAP/dstack dependency tree.
+#[cfg(feature = "attestation-dstack")]
+use dcap_qvl::QuoteCollateralV3;
+
 /// SHA-256/TDX-style 32-byte image measurement.
 pub type Measurement = [u8; 32];
 
@@ -68,19 +74,27 @@ pub struct MockQuote {
     pub tag: [u8; 32],
 }
 
-/// Raw Intel TDX quote as produced by dstack.
+/// Raw Intel TDX quote as produced by dstack, together with the DCAP
+/// collateral required to verify its signature against the Intel root of trust.
 ///
-/// Verification (report signature against the Intel root of trust, attestation
-/// report data parsing, event-log correlation) is W5 work. Until then the
-/// [`DstackAttestor`] returns an explicit error — it never admits.
+/// The attesting node obtains the `raw` quote from the dstack device manager
+/// (`/var/run/dstack.sock` → `GetQuote`) with its TLS cert public-key hash
+/// written into the TD `report_data`, fetches the DCAP `collateral` from a PCCS
+/// (see [`obtain_dstack_evidence`]), and ships both in this struct so the
+/// verifier needs **no network access** — the quote is self-contained.
+///
+/// The verifier ([`DstackAttestor`]) checks the report signature against the
+/// collateral's Intel-signed certificate chain, then extracts the attested
+/// measurement (TD `mr_td` + `rtmr0..3`) and the cert binding (`report_data`).
 #[cfg(feature = "attestation-dstack")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DstackQuote {
-    /// Raw TD quote bytes returned by `get_quote`.
+    /// Raw TD quote bytes returned by dstack `GetQuote`.
     pub raw: Vec<u8>,
-    /// User-defined report data (64 bytes per the TDX spec). The node writes
-    /// the TLS cert public-key hash here so the quote binds the cert.
-    pub report_data: Vec<u8>,
+    /// DCAP collateral (TCB info, QE identity, PCK cert chain, CRLs) used to
+    /// verify the quote's signature against the Intel root of trust. Fetched
+    /// once by the attesting node and carried with the quote.
+    pub collateral: QuoteCollateralV3,
 }
 
 /// What a successfully verified quote proves about the attesting node.
@@ -210,20 +224,37 @@ impl Attestor for MockAttestor {
 
 /// Real Intel TDX quote verifier via dstack.
 ///
-/// Behind the non-default `attestation-dstack` feature. Until the dstack SDK
-/// is wired (W5), [`Attestor::verify`] returns an explicit
-/// [`AttestationError::DstackVerify`] — it never admits.
+/// Behind the non-default `attestation-dstack` feature. `verify` delegates to
+/// [`verify_dstack_quote`], which checks the quote signature against the Intel
+/// root of trust (via `dcap-qvl`), then extracts the attested measurement and
+/// cert binding. It never admits a quote whose signature, collateral, or TCB
+/// status does not validate — there is no fallback path.
 #[cfg(feature = "attestation-dstack")]
 pub struct DstackAttestor {
-    // Placeholder for future dstack verifier config (root cert bundle,
-    // minimum TDX version, expected attestation report data layout, ...).
-    _priv: (),
+    /// Unix-seconds timestamp used as the DCAP "current time" for collateral
+    /// validity-window checks. Captured from the wall clock at construction so
+    /// expired collateral is rejected in production; injectable via
+    /// [`DstackAttestor::with_verify_time`] for reproducible verification.
+    verify_time: u64,
 }
 
 #[cfg(feature = "attestation-dstack")]
 impl DstackAttestor {
+    /// Construct a verifier that uses the current wall-clock time for DCAP
+    /// collateral validity checks (expired TCB info / QE identity / CRLs are
+    /// rejected). This is the production constructor.
     pub fn new() -> Self {
-        Self { _priv: () }
+        Self {
+            verify_time: wall_clock_secs(),
+        }
+    }
+
+    /// Construct a verifier pinned to an explicit verification time. Intended
+    /// for reproducible verification of a recorded quote/collateral pair (e.g.
+    /// a known-good image measurement captured on staging) where the
+    /// collateral's validity window predates the current wall clock.
+    pub fn with_verify_time(verify_time: u64) -> Self {
+        Self { verify_time }
     }
 }
 
@@ -245,16 +276,11 @@ impl Attestor for DstackAttestor {
         evidence: &AttestationEvidence,
     ) -> Result<VerifiedAttestation, AttestationError> {
         match evidence {
-            AttestationEvidence::Dstack(_quote) => {
-                // TODO(W5): verify the TDX quote signature against the Intel
-                // root of trust, extract `measurement` (MR TD/MRTD) and
-                // `cert_pubkey_hash` from the report data, and correlate the
-                // event log. Until the SDK is wired this MUST return an error
-                // rather than admit — fail closed.
-                Err(AttestationError::DstackVerify(
-                    "dstack quote verification is not yet implemented".to_string(),
-                ))
+            AttestationEvidence::Dstack(quote) => {
+                verify_dstack_quote(&quote.raw, &quote.collateral, self.verify_time)
             }
+            // Mock evidence presented to a dstack attestor: reject, do not
+            // fall back to treating it as anything else.
             AttestationEvidence::Mock(_) => Err(AttestationError::KindMismatch),
         }
     }
@@ -351,6 +377,259 @@ fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+// ---------------------------------------------------------------------------
+// Real Intel TDX quote verification (spec task W5)
+// ---------------------------------------------------------------------------
+//
+// `verify_dstack_quote` is the pure, network-free core: given the raw TDX
+// quote and the DCAP collateral it verifies the full Intel trust chain
+// (QE report / attestation-key signature / PCK cert chain / TCB info / QE
+// identity, all anchored at the Intel trusted root CA) via `dcap-qvl`, then
+// extracts:
+//
+//   * `measurement`        = blake3(mr_td || rtmr0 || rtmr1 || rtmr2 || rtmr3)
+//     — a 32-byte digest binding the full TD measurement register set (firmware
+//       td-shim via mr_td, and the runtime registers RTMR0..3 that cover the
+//       kernel, initrd, and the app/compose image). Pinning this digest in the
+//       admission allowlist is what makes a wrong/tampered node image be
+//       refused. (TDX registers are 48-byte SHA-384 values; we fold all five
+//       into the W3 32-byte [`Measurement`] via blake3 rather than truncate a
+//       single register.)
+//   * `cert_pubkey_hash`   = report_data[0..8] read as the LE `tls_derived_id`
+//     — the binding the attesting node wrote via dstack `GetQuote`, which must
+//       equal the registrant's presented `tls_derived_id` (checked by
+//       [`AdmissionAttestation::verify_registration`]).
+//
+// `obtain_dstack_evidence` is the attesting-node counterpart: it talks to the
+// dstack device manager over `/var/run/dstack.sock` to mint a quote bound to
+// the node's `tls_derived_id`, fetches the DCAP collateral from a PCCS, and
+// packages both into a [`DstackQuote`]. It is only callable from inside a real
+// dstack CVM (the Unix socket must exist) — there is no mock fallback.
+
+#[cfg(feature = "attestation-dstack")]
+fn wall_clock_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Number of bytes of TD `report_data` used to bind the TLS cert identity.
+///
+/// `tls_derived_id` is a `usize` (8 bytes on the 64-bit targets the MPC node
+/// runs on); we write exactly that many LE bytes at the start of the 64-byte
+/// `report_data` and zero-pad the rest, so the verifier can read them back
+/// unambiguously. Reading a fixed width keeps the on-wire binding stable.
+#[cfg(feature = "attestation-dstack")]
+const REPORT_DATA_BINDING_BYTES: usize = 8;
+
+/// Verify a raw Intel TDX quote against its DCAP collateral and extract the
+/// attested `(measurement, cert_pubkey_hash)`. This is the pure core of
+/// [`DstackAttestor::verify`]; it performs no I/O.
+///
+/// Fail-closed: any verification failure (signature, certificate chain, TCB
+/// status, malformed quote/report) surfaces as [`AttestationError::DstackVerify`].
+/// Only a quote that fully validates against the Intel root of trust yields a
+/// [`VerifiedAttestation`].
+#[cfg(feature = "attestation-dstack")]
+pub fn verify_dstack_quote(
+    raw_quote: &[u8],
+    collateral: &QuoteCollateralV3,
+    now_secs: u64,
+) -> Result<VerifiedAttestation, AttestationError> {
+    // Full Intel trust-chain verification (QE/ISV signatures, PCK cert chain,
+    // TCB info + QE identity collateral, CRLs) anchored at the Intel trusted
+    // root CA. `rustcrypto` selects the pure-Rust crypto backend (p256/sha2);
+    // no `ring` C dependency is pulled in.
+    let verified = dcap_qvl::verify::rustcrypto::verify(raw_quote, collateral, now_secs)
+        .map_err(|err| AttestationError::DstackVerify(format!(
+            "TDX quote verification failed: {err}"
+        )))?;
+
+    // Only a TD report carries the measurement registers we pin on. An SGX
+    // quote presented as dstack evidence is a kind mismatch — reject rather
+    // than fall back to a default measurement.
+    let td = verified.report.as_td10().ok_or_else(|| {
+        AttestationError::DstackVerify(
+            "dstack evidence must be a TD report (version 4), got non-TD".to_string(),
+        )
+    })?;
+
+    // Fold the full TD measurement register set into the W3 32-byte
+    // [`Measurement`]. Every register is hardware-attested, so this digest
+    // uniquely identifies the running image (firmware + kernel + app).
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&td.mr_td);
+    hasher.update(&td.rt_mr0);
+    hasher.update(&td.rt_mr1);
+    hasher.update(&td.rt_mr2);
+    hasher.update(&td.rt_mr3);
+    let measurement: Measurement = *hasher.finalize().as_bytes();
+
+    // Cert binding: the LE `tls_derived_id` the attesting node wrote at the
+    // start of report_data. `AdmissionAttestation::verify_registration` checks
+    // this equals the registrant's presented `tls_derived_id`.
+    let binding = td
+        .report_data
+        .get(..REPORT_DATA_BINDING_BYTES)
+        .ok_or_else(|| {
+            AttestationError::DstackVerify(format!(
+                "TD report_data is {} bytes; need >= {REPORT_DATA_BINDING_BYTES} for the cert binding",
+                td.report_data.len()
+            ))
+        })?;
+    let mut cert_bytes = [0u8; REPORT_DATA_BINDING_BYTES];
+    cert_bytes.copy_from_slice(binding);
+    let cert_pubkey_hash: CertPubKeyHash =
+        u64::from_le_bytes(cert_bytes) as CertPubKeyHash;
+
+    tracing::info!(
+        target: "stoffel::attestation::dstack",
+        measurement = %hex::encode(measurement),
+        mr_td = %hex::encode(&td.mr_td[..]),
+        rtmr3 = %hex::encode(&td.rt_mr3[..]),
+        cert_pubkey_hash,
+        tcb_status = %verified.status,
+        "dstack TDX quote verified against Intel root of trust"
+    );
+
+    Ok(VerifiedAttestation {
+        measurement,
+        cert_pubkey_hash,
+    })
+}
+
+/// dstack device-manager RPC endpoints used to mint a quote. See
+/// <https://github.com/Dstack-TEE/dstack> (`GetQuote`).
+#[cfg(feature = "attestation-dstack")]
+const DSTACK_GET_QUOTE_PATH: &str = "/GetQuote";
+
+/// Default location of the dstack device-manager Unix socket inside a CVM.
+/// Overridable via `STOFFEL_DSTACK_SOCKET` for non-standard layouts.
+#[cfg(feature = "attestation-dstack")]
+const DSTACK_DEFAULT_SOCKET: &str = "/var/run/dstack.sock";
+
+/// A `GetQuote` response from the dstack device manager. Only the fields the
+/// evidence packager needs are decoded; the rest are ignored.
+#[cfg(feature = "attestation-dstack")]
+#[derive(Debug, serde::Deserialize)]
+struct DstackGetQuoteResponse {
+    /// Hex-encoded raw TD quote.
+    quote: String,
+}
+
+/// Obtain real dstack TDX attestation evidence binding this node's TLS cert
+/// identity, for presentation to a [`DstackAttestor`] verifier.
+///
+/// Runs **inside** a dstack CVM: it opens the device-manager Unix socket
+/// (`/var/run/dstack.sock`, override with `STOFFEL_DSTACK_SOCKET`) and calls
+/// `GetQuote` with `report_data = tls_derived_id` (LE) zero-padded to 64 bytes,
+/// so the resulting quote cryptographically binds the node's TLS cert. It then
+/// fetches the DCAP collateral from a PCCS (`STOFFEL_DSTACK_PCCS_URL`, default
+/// the public Phala PCCS) and returns both in a [`DstackQuote`].
+///
+/// There is **no mock fallback**: if the dstack socket is absent (i.e. we are
+/// not inside a CVM) or the PCCS is unreachable, this returns an error. That is
+/// the contract — a node outside a TEE must not be able to fabricate evidence.
+#[cfg(feature = "attestation-dstack")]
+pub async fn obtain_dstack_evidence(tls_derived_id: PartyId) -> Result<AttestationEvidence, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+
+    let socket = std::env::var("STOFFEL_DSTACK_SOCKET")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DSTACK_DEFAULT_SOCKET.to_string());
+
+    // Build the 64-byte report_data: LE tls_derived_id at [0..8], zero-padded.
+    // The verifier reads exactly these bytes back as the cert binding.
+    let mut report_data = [0u8; 64];
+    report_data[..REPORT_DATA_BINDING_BYTES]
+        .copy_from_slice(&(tls_derived_id as u64).to_le_bytes());
+
+    // Minimal JSON-RPC over the dstack Unix socket. We hand-roll the request
+    // (rather than pull in the dstack-sdk crate and its alloy/bon dependency
+    // tree) — `GetQuote` is a single POST whose body is `{"report_data": <hex>}`.
+    let body = serde_json::json!({ "report_data": hex::encode(report_data) });
+    let body_bytes = serde_json::to_vec(&body).map_err(|e| format!("encode GetQuote body: {e}"))?;
+    let request = format!(
+        "POST {path} HTTP/1.1\r\n\
+         Host: dstack\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {len}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        path = DSTACK_GET_QUOTE_PATH,
+        len = body_bytes.len()
+    );
+
+    let mut stream = UnixStream::connect(&socket)
+        .await
+        .map_err(|e| format!("dstack socket {socket:?} not reachable (not inside a CVM?): {e}"))?;
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| format!("write GetQuote request: {e}"))?;
+    stream
+        .write_all(&body_bytes)
+        .await
+        .map_err(|e| format!("write GetQuote body: {e}"))?;
+    stream.flush().await.map_err(|e| format!("flush GetQuote: {e}"))?;
+
+    // Read the full HTTP response. `Connection: close` means the server hangs
+    // up after the body, so read-to-EOF collects it entirely.
+    let mut resp = Vec::with_capacity(4096);
+    stream
+        .read_to_end(&mut resp)
+        .await
+        .map_err(|e| format!("read GetQuote response: {e}"))?;
+    let json = extract_json_body(&resp)?;
+    let parsed: DstackGetQuoteResponse =
+        serde_json::from_slice(&json).map_err(|e| format!("decode GetQuote response: {e}"))?;
+    let raw = hex::decode(&parsed.quote)
+        .map_err(|e| format!("GetQuote returned non-hex quote: {e}"))?;
+
+    // Fetch the DCAP collateral from a PCCS so the verifier needs no network.
+    let pccs_url = std::env::var("STOFFEL_DSTACK_PCCS_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| dcap_qvl::PHALA_PCCS_URL.to_string());
+    let collateral = dcap_qvl::collateral::CollateralClient::<dcap_qvl::configs::DefaultConfig>::with_default_http(pccs_url)
+        .map_err(|e| format!("build PCCS collateral client: {e}"))?
+        .fetch(&raw)
+        .await
+        .map_err(|e| format!("fetch DCAP collateral from PCCS: {e}"))?;
+
+    tracing::info!(
+        target: "stoffel::attestation::dstack",
+        quote_len = raw.len(),
+        tls_derived_id,
+        "obtained dstack TDX quote bound to node TLS identity"
+    );
+
+    Ok(AttestationEvidence::Dstack(DstackQuote { raw, collateral }))
+}
+
+/// Pull the JSON object out of an HTTP/1.1 response read to EOF. Locates the
+/// first `{` after the blank line separating headers from the body.
+#[cfg(feature = "attestation-dstack")]
+fn extract_json_body(resp: &[u8]) -> Result<Vec<u8>, String> {
+    // Find the header/body boundary ("\r\n\r\n").
+    let boundary = b"\r\n\r\n";
+    let start = resp
+        .windows(boundary.len())
+        .position(|w| w == boundary)
+        .map(|p| p + boundary.len())
+        .ok_or_else(|| "GetQuote response had no HTTP header/body boundary".to_string())?;
+    let body = &resp[start..];
+    // Trim any trailing whitespace/chunked framing artifacts to the JSON object.
+    let first = body
+        .iter()
+        .position(|b| *b == b'{')
+        .ok_or_else(|| "GetQuote response body is not JSON".to_string())?;
+    Ok(body[first..].to_vec())
 }
 
 // ---------------------------------------------------------------------------
@@ -687,28 +966,259 @@ mod tests {
         assert!(adm.verify_registration(Some(&decoded), Some(4321)).is_ok());
     }
 
-    /// When the dstack feature is enabled, the DstackAttestor must return an
-    /// explicit error (never admit) until the SDK is actually wired.
+    // ---------------------------------------------------------------------
+    // Real Intel TDX quote verification (spec task W5).
+    //
+    // These exercise the *real* `DstackAttestor`/`verify_dstack_quote` against
+    // a genuine (public, Intel-issued) TDX quote + DCAP collateral vector, so
+    // the W3 fail-closed placeholder is provably replaced by working trust-chain
+    // verification. The vector is the canonical `dcap-qvl` sample
+    // (`sample/tdx_quote`), vendored under `tests/fixtures/dstack/`.
+    //
+    // Its collateral predates this test run, so we pin `now` inside the
+    // collateral validity window (mirroring how a staging operator pins the
+    // verification time when capturing a known-good image measurement).
+    // ---------------------------------------------------------------------
+
+    /// Minimal accessor for the vendored real TDX quote + collateral fixture.
+    #[cfg(feature = "attestation-dstack")]
+    fn real_tdx_fixture() -> (Vec<u8>, dcap_qvl::QuoteCollateralV3) {
+        let raw = include_bytes!("../tests/fixtures/dstack/tdx_quote.bin").to_vec();
+        let collateral_json =
+            include_str!("../tests/fixtures/dstack/tdx_quote_collateral.json");
+        let collateral: dcap_qvl::QuoteCollateralV3 =
+            serde_json::from_str(collateral_json).expect("deserialize tdx collateral");
+        (raw, collateral)
+    }
+
+    /// Pick a verification time inside the intersection of ALL collateral
+    /// validity windows at once: TCB info + QE identity (JSON
+    /// `issueDate`→`nextUpdate`), both CRLs (`thisUpdate`→`nextUpdate`), and
+    /// **every** certificate's `not_before`/`not_after` across all PEM chains in
+    /// the collateral (`tcb_info_issuer_chain`, `qe_identity_issuer_chain`,
+    /// `pck_certificate_chain` when present) plus any PCK cert chain embedded
+    /// in the quote itself.
+    ///
+    /// dcap-qvl enforces each of these against the verification time (TCB/QE
+    /// JSON expiry, CRL validity, and webpki cert-chain validity), so the
+    /// timestamp must lie inside their intersection. Returns the midpoint of
+    /// `[max(lower bounds), min(upper bounds)]`.
+    #[cfg(feature = "attestation-dstack")]
+    fn now_in_collateral_window(
+        raw_quote: &[u8],
+        collateral: &dcap_qvl::QuoteCollateralV3,
+    ) -> u64 {
+        let mut not_before: u64 = 0;
+        let mut not_after: u64 = u64::MAX;
+
+        // --- TCB info + QE identity JSON bounds (issueDate → nextUpdate) ---
+        fn json_bounds(json_str: &str) -> (u64, u64) {
+            let v: serde_json::Value =
+                serde_json::from_str(json_str).expect("collateral json");
+            let issue = v["issueDate"].as_str().expect("issueDate");
+            let next = v["nextUpdate"].as_str().expect("nextUpdate");
+            let i = chrono::DateTime::parse_from_rfc3339(issue)
+                .expect("issueDate parse")
+                .timestamp() as u64;
+            let n = chrono::DateTime::parse_from_rfc3339(next)
+                .expect("nextUpdate parse")
+                .timestamp() as u64;
+            (i, n)
+        }
+        for json in [&collateral.tcb_info, &collateral.qe_identity] {
+            let (lo, hi) = json_bounds(json);
+            not_before = not_before.max(lo);
+            not_after = not_after.min(hi);
+        }
+
+        // --- CRL validity windows (DER `thisUpdate` → `nextUpdate`) ---
+        for crl_der in [&collateral.root_ca_crl[..], &collateral.pck_crl[..]] {
+            let crl = <x509_cert::crl::CertificateList as der::Decode>::from_der(crl_der)
+                .expect("CRL DER parse");
+            not_before =
+                not_before.max(crl.tbs_cert_list.this_update.to_unix_duration().as_secs());
+            if let Some(next) = crl.tbs_cert_list.next_update {
+                not_after = not_after.min(next.to_unix_duration().as_secs());
+            }
+        }
+
+        // --- Certificate `not_before`/`not_after` across all PEM chains ---
+        fn fold_pem_chain(not_before: &mut u64, not_after: &mut u64, pem_str: &str) {
+            for entry in pem::parse_many(pem_str).expect("PEM parse") {
+                let cert =
+                    <x509_cert::Certificate as der::Decode>::from_der(entry.contents())
+                        .expect("cert DER parse");
+                let validity = &cert.tbs_certificate.validity;
+                *not_before = (*not_before).max(validity.not_before.to_unix_duration().as_secs());
+                *not_after = (*not_after).min(validity.not_after.to_unix_duration().as_secs());
+            }
+        }
+        fold_pem_chain(&mut not_before, &mut not_after, &collateral.tcb_info_issuer_chain);
+        fold_pem_chain(&mut not_before, &mut not_after, &collateral.qe_identity_issuer_chain);
+        if let Some(ref pck) = collateral.pck_certificate_chain {
+            fold_pem_chain(&mut not_before, &mut not_after, pck);
+        }
+
+        // PCK certs embedded in the quote (cert_type 5 / PCK_CERT_CHAIN). When
+        // the collateral struct does not carry `pck_certificate_chain`, the PCK
+        // chain lives in the quote's certification data; webpki checks its
+        // validity too, so fold it into the intersection. cert_type 5 is the
+        // Intel DCAP PCK cert chain (dcap-qvl `constants::PCK_CERT_CHAIN`).
+        const PCK_CERT_CHAIN_TYPE: u16 = 5;
+        if let Ok(quote) =
+            <dcap_qvl::quote::Quote as parity_scale_codec::Decode>::decode(&mut &raw_quote[..])
+        {
+            let auth = quote.auth_data.into_v3();
+            if auth.certification_data.cert_type == PCK_CERT_CHAIN_TYPE {
+                if let Ok(pem_str) = std::str::from_utf8(&auth.certification_data.body.data) {
+                    fold_pem_chain(&mut not_before, &mut not_after, pem_str);
+                }
+            }
+        }
+
+        assert!(
+            not_before < not_after,
+            "collateral validity window intersection is empty"
+        );
+        not_before + (not_after - not_before) / 2
+    }
+
+    /// Fail-closed stays guaranteed: a malformed (truncated) quote is rejected
+    /// with `DstackVerify`, and mock evidence is a `KindMismatch`. The verifier
+    /// never admits something it cannot fully validate.
     #[cfg(feature = "attestation-dstack")]
     #[test]
-    fn dstack_attestor_fails_closed_until_sdk_wired() {
+    fn dstack_attestor_rejects_malformed_quote_and_wrong_kind() {
         use AttestationEvidence as E;
-        let attestor = DstackAttestor::new();
-        // A (placeholder) dstack quote.
-        let evidence = E::Dstack(DstackQuote {
-            raw: vec![0u8; 4],
-            report_data: vec![0u8; 64],
-        });
-        let err = attestor
-            .verify(&evidence)
-            .expect_err("unwired dstack must not admit");
-        assert!(matches!(err, AttestationError::DstackVerify(_)));
+        let (raw, collateral) = real_tdx_fixture();
+        let now = now_in_collateral_window(&raw, &collateral);
+        let attestor = DstackAttestor::with_verify_time(now);
 
-        // And it rejects mock evidence outright (kind mismatch).
+        // Truncated bytes cannot decode as a TD quote -> hard reject.
+        let bad = E::Dstack(DstackQuote {
+            raw: vec![0u8; 4],
+            collateral: collateral.clone(),
+        });
+        let err = attestor.verify(&bad).expect_err("malformed quote must reject");
+        assert!(matches!(err, AttestationError::DstackVerify(_)), "got {err:?}");
+
+        // Real raw bytes but a different (mock) evidence kind -> kind mismatch.
+        let _ = raw; // (fixture sanity; real quote exercised below)
         let mock = MockAttestor::new([0; 32]).generate(GOOD_MEASUREMENT, 1);
         assert!(matches!(
             attestor.verify(&mock),
             Err(AttestationError::KindMismatch)
         ));
+    }
+
+    /// A real, Intel-issued TDX quote verifies against the Intel root of trust
+    /// and yields a deterministic measurement + cert binding. This is the proof
+    /// that the W3 placeholder was actually wired to real TDX.
+    #[cfg(feature = "attestation-dstack")]
+    #[test]
+    fn verify_dstack_quote_extracts_measurement_and_cert_binding() {
+        let (raw, collateral) = real_tdx_fixture();
+        let now = now_in_collateral_window(&raw, &collateral);
+
+        let verified = verify_dstack_quote(&raw, &collateral, now)
+            .expect("real TDX quote must verify against the Intel root of trust");
+
+        // The measurement is a non-zero 32-byte blake3 digest of the verified
+        // TD measurement registers (a tampered image would change it).
+        assert_ne!(verified.measurement, [0u8; 32]);
+
+        // Pure & deterministic: re-verifying the same quote yields identical
+        // measurement + cert binding (reproducibility for staging pinning).
+        let verified2 = verify_dstack_quote(&raw, &collateral, now).expect("re-verify");
+        assert_eq!(verified.measurement, verified2.measurement);
+        assert_eq!(verified.cert_pubkey_hash, verified2.cert_pubkey_hash);
+    }
+
+    /// Full admission path against real TDX evidence (W3 `AdmissionAttestation`
+    /// over W5 `DstackAttestor`): an allowlisted measurement with a matching
+    /// cert binding ADMITS.
+    #[cfg(feature = "attestation-dstack")]
+    #[test]
+    fn dstack_admission_admits_real_tdx_quote_with_matching_measurement() {
+        let (raw, collateral) = real_tdx_fixture();
+        let now = now_in_collateral_window(&raw, &collateral);
+        let verified = verify_dstack_quote(&raw, &collateral, now).expect("verify");
+        let measurement = verified.measurement;
+        let cert = verified.cert_pubkey_hash;
+
+        let evidence = AttestationEvidence::Dstack(DstackQuote {
+            raw,
+            collateral: collateral.clone(),
+        });
+        let adm = AdmissionAttestation::new(
+            Box::new(DstackAttestor::with_verify_time(now)),
+            vec![measurement],
+        );
+        assert_eq!(adm.kind(), AttestorKind::Dstack);
+        assert_eq!(
+            adm.verify_registration(Some(&evidence), Some(cert))
+                .expect("real TDX quote with allowlisted measurement must ADMIT"),
+            cert
+        );
+    }
+
+    /// A real, signature-valid TDX quote whose measurement is NOT on the
+    /// allowlist is refused — the wrong/tampered-image case. (We cannot tamper
+    /// the quote itself: that breaks the signature first. Instead we verify the
+    /// genuine quote and put a *different* measurement in the allowlist, which
+    /// is exactly the operator-side refusal for an unexpected image.)
+    #[cfg(feature = "attestation-dstack")]
+    #[test]
+    fn dstack_admission_rejects_unallowlisted_measurement() {
+        let (raw, collateral) = real_tdx_fixture();
+        let now = now_in_collateral_window(&raw, &collateral);
+        let verified = verify_dstack_quote(&raw, &collateral, now).expect("verify");
+        let cert = verified.cert_pubkey_hash;
+        let evidence = AttestationEvidence::Dstack(DstackQuote { raw, collateral });
+
+        // Allowlist only the mock "GOOD_MEASUREMENT" (unrelated to the real
+        // quote's measurement) -> the real measurement is refused.
+        let adm = AdmissionAttestation::new(
+            Box::new(DstackAttestor::with_verify_time(now)),
+            vec![GOOD_MEASUREMENT],
+        );
+        let err = adm
+            .verify_registration(Some(&evidence), Some(cert))
+            .expect_err("unallowlisted measurement must be REJECTED");
+        assert_eq!(
+            err,
+            AttestationError::MeasurementNotAllowed {
+                found: verified.measurement
+            }
+        );
+    }
+
+    /// A real, signature-valid TDX quote presented under the WRONG
+    /// `tls_derived_id` is refused — cert binding is enforced end-to-end.
+    #[cfg(feature = "attestation-dstack")]
+    #[test]
+    fn dstack_admission_rejects_cert_binding_mismatch() {
+        let (raw, collateral) = real_tdx_fixture();
+        let now = now_in_collateral_window(&raw, &collateral);
+        let verified = verify_dstack_quote(&raw, &collateral, now).expect("verify");
+        let measurement = verified.measurement;
+        let real_cert = verified.cert_pubkey_hash;
+        let impostor_cert = real_cert.wrapping_add(1);
+        let evidence = AttestationEvidence::Dstack(DstackQuote { raw, collateral });
+
+        let adm = AdmissionAttestation::new(
+            Box::new(DstackAttestor::with_verify_time(now)),
+            vec![measurement],
+        );
+        let err = adm
+            .verify_registration(Some(&evidence), Some(impostor_cert))
+            .expect_err("cert binding mismatch must be REJECTED");
+        assert_eq!(
+            err,
+            AttestationError::CertBindingMismatch {
+                bound: real_cert,
+                presented: impostor_cert
+            }
+        );
     }
 }
