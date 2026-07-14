@@ -117,4 +117,5 @@ ENV STOFFEL_HTTP_ADDR="0.0.0.0:8090"
 # 16180 = submission RPC (W4) — NOT proxied; reached directly
 EXPOSE 8090 9000 10000 16180
 
-ENTRYPOINT ["/app/stoffel-run"]
+COPY docker/entrypoint.sh /app/entrypoint.sh
+ENTRYPOINT ["/bin/bash", "/app/entrypoint.sh"]
