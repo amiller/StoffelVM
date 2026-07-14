@@ -98,10 +98,18 @@ pub struct DstackQuote {
 }
 
 /// What a successfully verified quote proves about the attesting node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `tcb_status` is the human-readable TCB (Trusted Computing Base) status the
+/// verifier resolved for the quote — e.g. `UpToDate` for real TDX (the string
+/// `dcap-qvl` returns from the merged platform/QE TCB levels), or `UpToDate`
+/// for the mock attestor (a mock quote that verifies is, by construction,
+/// fully valid). Carried so a node can report its own attested state via the
+/// HTTP observability endpoint without re-verifying.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedAttestation {
     pub measurement: Measurement,
     pub cert_pubkey_hash: CertPubKeyHash,
+    pub tcb_status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -209,9 +217,13 @@ impl Attestor for MockAttestor {
                 if !ct_eq(&expected, &q.tag) {
                     return Err(AttestationError::InvalidQuote);
                 }
+                // A mock quote that verifies is, by construction, fully
+                // valid — report that as the TCB status rather than fabricate
+                // a hardware-specific value.
                 Ok(VerifiedAttestation {
                     measurement: q.measurement,
                     cert_pubkey_hash: q.cert_pubkey_hash,
+                    tcb_status: "UpToDate".to_string(),
                 })
             }
             // Dstack evidence presented to a mock attestor: reject, do not
@@ -498,6 +510,7 @@ pub fn verify_dstack_quote(
     Ok(VerifiedAttestation {
         measurement,
         cert_pubkey_hash,
+        tcb_status: verified.status,
     })
 }
 

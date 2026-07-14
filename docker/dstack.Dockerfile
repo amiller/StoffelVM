@@ -104,7 +104,17 @@ ENV STOFFEL_ATTESTATION_ALLOWED_MEASUREMENTS=""
 # PCCS used by `obtain_dstack_evidence` to fetch DCAP collateral. Default is the
 # public Phala PCCS; staging may point this at a local/cached PCCS.
 ENV STOFFEL_DSTACK_PCCS_URL="https://pccs.phala.network"
+# W6 HTTP observability server. The dstack-webhost `tee-daemon` HTTP-proxies
+# exactly ONE image_port per app; this is it. GET /health is the liveness
+# probe and GET /attestation reports this node's own attested measurement once
+# obtained (the "stoffel running attested on the dstack pod" report). The
+# submission RPC (16180) is a SEPARATE, non-proxied port.
+ENV STOFFEL_HTTP_ADDR="0.0.0.0:8090"
 
-EXPOSE 9000 10000 16180
+# 8090  = W6 HTTP observability (the dstack-proxied image_port)
+# 9000  = bootnode coordination (leader)
+# 10000 = party-to-party MPC traffic
+# 16180 = submission RPC (W4) — NOT proxied; reached directly
+EXPOSE 8090 9000 10000 16180
 
 ENTRYPOINT ["/app/stoffel-run"]

@@ -218,15 +218,29 @@ fn session_registration_timeout() -> Duration {
 /// register without evidence. Registering without evidence under an attesting
 /// bootnode would just be refused anyway; failing fast gives a clear error.
 ///
+/// W6: when dstack evidence IS obtained, this also locally pre-verifies it and
+/// records this node's own attested measurement / `tls_derived_id` / `tcb_status`
+/// into `observability` so the HTTP `GET /attestation` endpoint can report
+/// "this node is running attested on the dstack pod". The measurement is
+/// independent of `report_data`, so a self-verify is valid (this is the same
+/// step `stoffel-dstack-measurement` performs). The pre-verify never masks the
+/// fail-closed contract: on obtain-failure the node still exits, and a
+/// pre-verify failure leaves the measurement unset (the `/attestation` body
+/// then honestly reports the mode with no fabricated measurement). Admission
+/// is still independently re-verified by the bootnode's `verify_registration`.
+///
 /// `mock` attestation is CI-only (exercised by the in-process tests) and is not
 /// wired into the node binary; requesting it is treated as misconfiguration.
 async fn registration_attestation(
     tls_derived_id: stoffelnet::network_utils::PartyId,
+    observability: stoffel_vm_runner::http_observability::ObservabilityState,
 ) -> Option<AttestationEvidence> {
-    // `tls_derived_id` is only consumed in the `dstack` arm under the
-    // `attestation-dstack` feature; reference it once so the no-feature build
-    // does not warn (the value is still used verbatim under the feature).
+    // `tls_derived_id` / `observability` are only consumed in the `dstack` arm
+    // under the `attestation-dstack` feature; reference each once so the
+    // no-feature build does not warn (they are still used verbatim under the
+    // feature).
     let _ = &tls_derived_id;
+    let _ = &observability;
     let mode = env::var("STOFFEL_ATTESTATION_MODE")
         .ok()
         .map(|m| m.trim().to_ascii_lowercase())
@@ -242,6 +256,50 @@ async fn registration_attestation(
                 );
                 match stoffel_vm::net::attestation::obtain_dstack_evidence(tls_derived_id).await {
                     Ok(evidence) => {
+                        // W6: capture this node's own attested measurement so
+                        // the /attestation endpoint can report it. The
+                        // measurement is independent of report_data, so a
+                        // local self-verify is valid (same step the
+                        // `stoffel-dstack-measurement` tool performs). A
+                        // pre-verify failure does NOT mask admission: the
+                        // bootnode independently re-verifies at registration,
+                        // and a bad quote is refused there. It only means we
+                        // cannot (yet) self-report the measurement.
+                        if let stoffel_vm::net::attestation::AttestationEvidence::Dstack(
+                            ref quote,
+                        ) = evidence
+                        {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            match stoffel_vm::net::attestation::verify_dstack_quote(
+                                &quote.raw,
+                                &quote.collateral,
+                                now,
+                            ) {
+                                Ok(verified) => {
+                                    let measurement_hex = hex::encode(verified.measurement);
+                                    let tls_id = verified.cert_pubkey_hash;
+                                    let tcb = verified.tcb_status.clone();
+                                    observability
+                                        .record_attested_measurement(
+                                            measurement_hex.clone(),
+                                            tls_id,
+                                            tcb.clone(),
+                                        )
+                                        .await;
+                                    eprintln!(
+                                        "[party] dstack attested measurement: {measurement_hex} (tls_derived_id={tls_id}, tcb_status={tcb})"
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[party] WARNING: obtained dstack quote but could not locally pre-verify it for /attestation reporting: {e}"
+                                    );
+                                }
+                            }
+                        }
                         eprintln!("[party] obtained dstack TDX attestation evidence");
                         return Some(evidence);
                     }
@@ -273,6 +331,40 @@ async fn registration_attestation(
             );
             exit(13);
         }
+    }
+}
+
+/// Canonical attestation mode from the environment (`disabled` / `mock` /
+/// `dstack`), lowercased + trimmed, defaulting to `disabled`. Matches the
+/// normalization [`registration_attestation`] uses so the HTTP
+/// `GET /attestation` body reports the mode the node actually acts on.
+fn attestation_mode_from_env() -> String {
+    env::var("STOFFEL_ATTESTATION_MODE")
+        .ok()
+        .map(|m| m.trim().to_ascii_lowercase())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| "disabled".to_string())
+}
+
+/// Resolve the node's role string for the HTTP `GET /health` body, in the same
+/// precedence `main` dispatches roles (`bootnode`-only, then `client`, then
+/// `leader`, then plain `party`, else a `local` single-process run).
+fn node_role_string(
+    as_client: bool,
+    as_bootnode: bool,
+    as_leader: bool,
+    bootstrap: Option<&SocketAddr>,
+) -> String {
+    if as_bootnode && !as_leader {
+        "bootnode".to_string()
+    } else if as_client {
+        "client".to_string()
+    } else if as_leader {
+        "leader".to_string()
+    } else if bootstrap.is_some() {
+        "party".to_string()
+    } else {
+        "local".to_string()
     }
 }
 
@@ -4019,6 +4111,36 @@ async fn main() {
         exit(2);
     }
 
+    // W6: HTTP observability server. Spawned at startup so the node is reachable
+    // through the dstack-webhost `tee-daemon`, which HTTP-proxies exactly one
+    // `image_port` per app. GET /health is the liveness probe; GET /attestation
+    // reports the node's own attested measurement once obtained. Binding is
+    // eager — a bind failure is fatal (the node stays observable or fails
+    // loudly; it does not silently run without the probe endpoint).
+    let observability = stoffel_vm_runner::http_observability::ObservabilityState::new(
+        node_role_string(as_client, as_bootnode, as_leader, bootstrap_addr.as_ref()),
+        party_id,
+        attestation_mode_from_env(),
+    );
+    match stoffel_vm_runner::http_observability::http_addr_from_env() {
+        Ok(http_addr) => {
+            eprintln!(
+                "[http] spawning observability server on http://{} (GET /health, GET /attestation)",
+                http_addr
+            );
+            tokio::spawn(
+                stoffel_vm_runner::http_observability::serve_http_observability(
+                    observability.clone(),
+                    http_addr,
+                ),
+            );
+        }
+        Err(e) => {
+            eprintln!("FATAL: {e}");
+            exit(2);
+        }
+    }
+
     // Bootnode-only mode (no program execution)
     if as_bootnode && !as_leader {
         let bind = bind_addr.unwrap_or_else(|| "127.0.0.1:9000".parse().unwrap());
@@ -4334,7 +4456,8 @@ async fn main() {
         // node's TLS identity and present it so the bootnode admission gate can
         // verify it before this peer is admitted. Fail-closed: the helper exits
         // the process if evidence is required but cannot be obtained.
-        let attestation = registration_attestation(mgr.local_derived_id()).await;
+        let attestation =
+            registration_attestation(mgr.local_derived_id(), observability.clone()).await;
         let session_info = match register_and_wait_for_session(
             &mut mgr,
             SessionRegistrationConfig {
@@ -4433,7 +4556,8 @@ async fn main() {
         };
         // W5: obtain attestation evidence bound to this node's TLS identity when
         // attestation is enabled (fail-closed; see `registration_attestation`).
-        let attestation = registration_attestation(mgr.local_derived_id()).await;
+        let attestation =
+            registration_attestation(mgr.local_derived_id(), observability.clone()).await;
         let session_info = match register_and_wait_for_session(
             &mut mgr,
             SessionRegistrationConfig {

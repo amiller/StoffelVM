@@ -1,3 +1,4 @@
+pub mod http_observability;
 pub mod local_runner;
 
 pub use local_runner::{

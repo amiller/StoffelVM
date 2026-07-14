@@ -14,8 +14,16 @@
 #   3. Set STOFFEL_ATTESTATION_ALLOWED_MEASUREMENTS=<that hex> and launch N
 #      replicas with dstack, role-splitting leader vs party.
 #
-# The dstack device manager exposes the TDX quote service at /var/run/dstack.sock
-# inside the CVM; bind-mounting it is what lets the node call `GetQuote`.
+# The dstack-webhost exposes a filtered broker device-manager socket at
+# /run/broker/dstack.sock (allows only `GetQuote`); bind-mounting it is what
+# lets the node obtain its own TDX quote.
+
+# dstack-webhost `tee-daemon` HTTP-proxies EXACTLY ONE port per app. Publish
+# the W6 HTTP observability server (8090) as that `image_port` so the node is
+# observable from outside the CVM: GET /health (liveness) and
+# GET /attestation (running-attested report). The submission RPC (16180) is a
+# separate, non-proxied port reached directly.
+image_port: 8090
 
 services:
   stoffel-node:
@@ -40,16 +48,30 @@ services:
       STOFFEL_ATTESTATION_MODE: dstack
       STOFFEL_ATTESTATION_ALLOWED_MEASUREMENTS: ${STOFFEL_ATTESTATION_ALLOWED_MEASUREMENTS:?expected image measurement must be pinned}
       STOFFEL_DSTACK_PCCS_URL: ${STOFFEL_DSTACK_PCCS_URL:-https://pccs.phala.network}
+      # On the dstack-webhost the device-manager socket is the FILTERED broker
+      # at /run/broker/dstack.sock, which allows `GetQuote` (what the node needs
+      # to obtain its own quote) and nothing else. Point the node's dstack
+      # client at it explicitly.
+      STOFFEL_DSTACK_SOCKET: /run/broker/dstack.sock
+      # W6 HTTP observability server. The dstack-webhost tee-daemon HTTP-proxies
+      # exactly ONE image_port per app; bind it to all interfaces so the gateway
+      # can reach it from outside the CVM. (Submission RPC stays on 16180.)
+      STOFFEL_HTTP_ADDR: "0.0.0.0:8090"
       RUST_LOG: ${RUST_LOG:-stoffel::attestation=info,info}
     ports:
+      # 8090 = W6 HTTP observability — this is the dstack-proxied image_port
+      #        (GET /health liveness + GET /attestation running-attested report).
+      - "8090:8090"
       - "9000:9000"    # bootnode coordination (leader)
       - "10000:10000"  # party-to-party MPC traffic
-      - "16180:16180"  # node RPC / submission endpoint (W4)
-    # dstack device manager socket: required for the node to obtain its TDX
-    # quote (`obtain_dstack_evidence`). Absent outside a real CVM, in which case
-    # the node exits (fail-closed) rather than register without evidence.
+      - "16180:16180"  # submission RPC (W4) — NOT proxied; reached directly
+    # dstack device-manager socket: required for the node to obtain its TDX
+    # quote (`obtain_dstack_evidence`). On the dstack-webhost this is the
+    # FILTERED broker at /run/broker/dstack.sock (allows only `GetQuote`).
+    # Absent outside a real CVM, in which case the node exits (fail-closed)
+    # rather than register without evidence.
     volumes:
-      - /var/run/dstack.sock:/var/run/dstack.sock
+      - /run/broker/dstack.sock:/run/broker/dstack.sock
     # Content-addressed program cache + preprocessing store survive restarts
     # (W2 persistence) and are per-instance under /data.
     volumes_from:

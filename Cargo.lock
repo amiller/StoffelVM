@@ -6237,6 +6237,7 @@ dependencies = [
  "libc",
  "rustls",
  "serde",
+ "serde_json",
  "stoffel-mpc-coordinator-off-chain",
  "stoffel-mpc-coordinator-shared",
  "stoffel-vm",
