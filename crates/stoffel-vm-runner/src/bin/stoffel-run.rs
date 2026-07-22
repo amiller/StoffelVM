@@ -26,7 +26,7 @@ use stoffel_vm::net::{
 };
 use stoffel_vm::net::{
     program_id_from_bytes, register_and_wait_for_session,
-    run_bootnode_with_config_and_attestation_and_callback, SessionRegistrationConfig,
+    run_bootnode_with_config_and_callback, SessionRegistrationConfig,
 };
 use stoffel_vm::net::attestation::AttestationEvidence;
 use stoffel_vm::net::{MpcBackendKind, MpcCurveConfig};
@@ -4158,14 +4158,8 @@ async fn main() {
             });
         });
         // Pass expected parties if specified, so bootnode waits for all before announcing session
-        if let Err(e) = run_bootnode_with_config_and_attestation_and_callback(
-            bind,
-            n_parties,
-            None,
-            None,
-            Some(admission_callback),
-        )
-        .await
+        if let Err(e) =
+            run_bootnode_with_config_and_callback(bind, n_parties, Some(admission_callback)).await
         {
             eprintln!("Bootnode error: {}", e);
             exit(10);
@@ -4428,11 +4422,9 @@ async fn main() {
             });
         });
         tokio::spawn(async move {
-            if let Err(e) = run_bootnode_with_config_and_attestation_and_callback(
+            if let Err(e) = run_bootnode_with_config_and_callback(
                 bootnode_bind,
                 Some(bootnode_n),
-                None,
-                None,
                 Some(admission_callback),
             )
             .await

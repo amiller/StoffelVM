@@ -193,6 +193,17 @@ pub async fn run_bootnode_with_config(
     bind: SocketAddr,
     expected_parties: Option<usize>,
 ) -> Result<(), String> {
+    run_bootnode_with_config_and_callback(bind, expected_parties, None).await
+}
+
+/// W7: same env-driven auth + attestation admission as `run_bootnode_with_config`,
+/// plus an optional admission callback for HTTP observability. stoffel-run must use
+/// this (not the `_and_attestation_` variant) so the env-driven gate cannot be bypassed.
+pub async fn run_bootnode_with_config_and_callback(
+    bind: SocketAddr,
+    expected_parties: Option<usize>,
+    admission_callback: Option<AdmissionCallback>,
+) -> Result<(), String> {
     let required_auth_token = required_discovery_auth_token("bootnode discovery registration")?;
     eprintln!("[bootnode] Discovery registration authentication enabled");
     let attestation = attestation_admission_from_env()?;
@@ -203,11 +214,12 @@ pub async fn run_bootnode_with_config(
             adm.allowed_measurements_len()
         );
     }
-    run_bootnode_with_config_and_attestation(
+    run_bootnode_with_config_and_attestation_and_callback(
         bind,
         expected_parties,
         Some(required_auth_token),
         attestation,
+        admission_callback,
     )
     .await
 }
