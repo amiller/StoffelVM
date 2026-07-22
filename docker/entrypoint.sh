@@ -87,25 +87,17 @@ wait_for_host() {
 
     echo "Waiting for ${host}:${port} to be available (QUIC/UDP)..."
 
-    # For QUIC (UDP), we can't easily check with nc, so we use a simple
-    # connectivity test by trying to send a UDP packet and checking if
-    # the host is reachable. The application has its own retry logic.
+    # QUIC is UDP and ping/raw sockets are unavailable under gVisor (runsc),
+    # so the only portable readiness signal is DNS: the peer's name resolves
+    # once its container is attached to the shared network. The application
+    # has its own connection retry logic beyond that.
     while [ $attempt -le $max_attempts ]; do
-        # Check if host is reachable via ping (basic network connectivity)
-        if ping -c 1 -W 1 "$host" >/dev/null 2>&1; then
-            # Try UDP connection test with nc -u
-            if timeout 1 bash -c "echo '' | nc -u -w 1 $host $port" 2>/dev/null; then
-                echo "${host}:${port} appears reachable!"
-                return 0
-            fi
-            # If UDP check is inconclusive, just verify ping works and continue
-            # The application will handle connection retries
-            echo "Host ${host} is reachable, assuming bootnode is starting..."
-            sleep 2
+        if getent hosts "$host" >/dev/null 2>&1; then
+            echo "${host} resolves; proceeding (app handles QUIC retries)"
             return 0
         fi
-        echo "Attempt ${attempt}/${max_attempts}: ${host} not reachable, waiting..."
-        sleep 1
+        echo "Attempt ${attempt}/${max_attempts}: ${host} not resolvable yet, waiting..."
+        sleep 2
         attempt=$((attempt + 1))
     done
 
