@@ -25,8 +25,8 @@ use stoffel_vm::net::{
     honeybadger_protocol_instance_id, honeybadger_protocol_timeout, spawn_receive_loops_split,
 };
 use stoffel_vm::net::{
-    program_id_from_bytes, register_and_wait_for_session, run_bootnode_with_config,
-    SessionRegistrationConfig,
+    program_id_from_bytes, register_and_wait_for_session,
+    run_bootnode_with_config_and_attestation_and_callback, SessionRegistrationConfig,
 };
 use stoffel_vm::net::attestation::AttestationEvidence;
 use stoffel_vm::net::{MpcBackendKind, MpcCurveConfig};
@@ -4149,8 +4149,24 @@ async fn main() {
         rustls::crypto::ring::default_provider()
             .install_default()
             .expect("install rustls crypto");
+        // W7: Set up callback to update HTTP observability /peers endpoint
+        let observability_clone = observability.clone();
+        let admission_callback = std::sync::Arc::new(move |records| {
+            let obs = observability_clone.clone();
+            tokio::spawn(async move {
+                obs.update_admission_records(records).await;
+            });
+        });
         // Pass expected parties if specified, so bootnode waits for all before announcing session
-        if let Err(e) = run_bootnode_with_config(bind, n_parties).await {
+        if let Err(e) = run_bootnode_with_config_and_attestation_and_callback(
+            bind,
+            n_parties,
+            None,
+            None,
+            Some(admission_callback),
+        )
+        .await
+        {
             eprintln!("Bootnode error: {}", e);
             exit(10);
         }
@@ -4403,8 +4419,24 @@ async fn main() {
         // Spawn bootnode in background
         let bootnode_bind = bind;
         let bootnode_n = n;
+        // W7: Set up callback to update HTTP observability /peers endpoint
+        let observability_clone = observability.clone();
+        let admission_callback = std::sync::Arc::new(move |records| {
+            let obs = observability_clone.clone();
+            tokio::spawn(async move {
+                obs.update_admission_records(records).await;
+            });
+        });
         tokio::spawn(async move {
-            if let Err(e) = run_bootnode_with_config(bootnode_bind, Some(bootnode_n)).await {
+            if let Err(e) = run_bootnode_with_config_and_attestation_and_callback(
+                bootnode_bind,
+                Some(bootnode_n),
+                None,
+                None,
+                Some(admission_callback),
+            )
+            .await
+            {
                 eprintln!("Bootnode error: {}", e);
             }
         });

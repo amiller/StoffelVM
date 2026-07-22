@@ -40,6 +40,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::Value;
+use stoffel_vm::net::discovery::AdmissionRecords;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
@@ -78,6 +79,11 @@ pub struct ObservabilitySnapshot {
     /// Present only alongside `measurement`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tcb_status: Option<String>,
+    /// W7: Peer admission records (bootnode/leader only). Populated when the
+    /// node is running as bootnode or leader; shows which peers were admitted
+    /// or rejected via attestation, and why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_records: Option<AdmissionRecords>,
 }
 
 impl ObservabilitySnapshot {
@@ -137,6 +143,7 @@ impl ObservabilityState {
                 measurement: None,
                 tls_derived_id: None,
                 tcb_status: None,
+                admission_records: None,
             })),
         }
     }
@@ -154,6 +161,13 @@ impl ObservabilityState {
         guard.measurement = Some(measurement.into());
         guard.tls_derived_id = Some(tls_derived_id);
         guard.tcb_status = Some(tcb_status.into());
+    }
+
+    /// W7: Update the admission records (called by bootnode on peer admissions/
+    /// rejections). The /peers endpoint surfaces these records.
+    pub async fn update_admission_records(&self, records: AdmissionRecords) {
+        let mut guard = self.inner.write().await;
+        guard.admission_records = Some(records);
     }
 
     /// Point-in-time snapshot for serializing a response.
@@ -268,11 +282,12 @@ async fn dispatch(path: Option<String>, state: &ObservabilityState) -> (&'static
     match path.as_deref() {
         Some("/health") => ("200 OK", health_body(&snapshot)),
         Some("/attestation") => ("200 OK", attestation_body(&snapshot)),
+        Some("/peers") => ("200 OK", peers_body(&snapshot)),
         // No error-masking routing: unknown paths are a real 404, not a silent
         // /health fallback that could mask a misconfigured probe.
         _ => (
             "404 Not Found",
-            r#"{"error":"not found","routes":["GET /health","GET /attestation"]}"#.to_string(),
+            r#"{"error":"not found","routes":["GET /health","GET /attestation","GET /peers"]}"#.to_string(),
         ),
     }
 }
@@ -285,6 +300,19 @@ fn health_body(snapshot: &ObservabilitySnapshot) -> String {
 fn attestation_body(snapshot: &ObservabilitySnapshot) -> String {
     serde_json::to_string(&snapshot.attestation_json())
         .unwrap_or_else(|_| r#"{"attestation_mode":"disabled"}"#.to_string())
+}
+
+/// W7: /peers body. Returns admission records (admitted/rejected peers with
+/// measurements/reasons). This is the only observability into the attestation
+/// gate on the dstack pod (no logs).
+fn peers_body(snapshot: &ObservabilitySnapshot) -> String {
+    // If admission_records is None (not a bootnode/leader), return empty records
+    let records = snapshot.admission_records.clone().unwrap_or(AdmissionRecords {
+        admitted: Vec::new(),
+        rejected: Vec::new(),
+    });
+    serde_json::to_string(&records)
+        .unwrap_or_else(|_| r#"{"admitted":[],"rejected":[]}"#.to_string())
 }
 
 /// Serialize a minimal HTTP/1.1 response. `Connection: close` so each request
@@ -530,5 +558,65 @@ mod tests {
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["attestation_mode"], "disabled");
         assert!(v.get("measurement").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // W7: /peers endpoint tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn peers_endpoint_returns_empty_records_when_no_admissions() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = state("leader", Some(0), "dstack");
+        tokio::spawn(accept_loop(listener, state));
+
+        let (status, body) = get(addr, "/peers").await;
+        assert_eq!(status, "200");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(v["admitted"].as_array().unwrap().is_empty());
+        assert!(v["rejected"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn peers_endpoint_returns_admission_records() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = state("leader", Some(0), "dstack");
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let records = AdmissionRecords {
+            admitted: vec![PeerAdmission {
+                party_id: 1,
+                measurement_hex: Some("aa".repeat(32)),
+                admitted_at: now,
+            }],
+            rejected: vec![PeerRejection {
+                reason: "attestation: MeasurementNotAllowed".to_string(),
+                rejected_at: now,
+            }],
+        };
+        state.update_admission_records(records).await;
+
+        tokio::spawn(accept_loop(listener, state));
+
+        let (status, body) = get(addr, "/peers").await;
+        assert_eq!(status, "200");
+        let v: Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(v["admitted"].as_array().unwrap().len(), 1);
+        assert_eq!(v["admitted"][0]["party_id"], 1);
+        assert_eq!(v["admitted"][0]["measurement_hex"], "aa".repeat(32));
+        assert_eq!(v["admitted"][0]["admitted_at"], now);
+
+        assert_eq!(v["rejected"].as_array().unwrap().len(), 1);
+        assert!(v["rejected"][0]["reason"].as_str().contains("MeasurementNotAllowed"));
+        assert_eq!(v["rejected"][0]["rejected_at"], now);
     }
 }

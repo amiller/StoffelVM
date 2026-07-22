@@ -164,7 +164,8 @@ pub use avss_server::{
 // Re-export discovery helpers
 pub use discovery::{
     bootstrap_with_bootnode, register_and_wait_for_session, run_bootnode, run_bootnode_with_config,
-    wait_until_min_parties, DiscoveryMessage, SessionRegistrationConfig,
+    run_bootnode_with_config_and_attestation_and_callback, wait_until_min_parties, DiscoveryMessage,
+    SessionRegistrationConfig,
 };
 // Re-export program sync + session helpers
 pub use program_sync::{

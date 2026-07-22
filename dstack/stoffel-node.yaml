@@ -34,7 +34,7 @@ services:
     environment:
       STOFFEL_ROLE: ${STOFFEL_ROLE:-leader}
       STOFFEL_PARTY_ID: ${STOFFEL_PARTY_ID:-0}
-      STOFFEL_N_PARTIES: ${STOFFEL_N_PARTIES:-3}
+      STOFFEL_N_PARTIES: ${STOFFEL_N_PARTIES:-4}
       STOFFEL_THRESHOLD: ${STOFFEL_THRESHOLD:-1}
       STOFFEL_BIND_ADDR: "0.0.0.0:9000"
       # Leader's discovery address, as reachable from each party CVM. Set per

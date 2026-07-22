@@ -4,10 +4,53 @@ use crate::net::{
     program_sync::{send_ctrl as send_prog_ctrl, send_program_bytes, ProgramSyncMessage},
     session::{derive_instance_id, random_instance_id, SessionInfo, SessionMessage},
 };
+use serde::Serialize;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use stoffelnet::network_utils::PartyId;
 use stoffelnet::transports::quic::PeerConnection;
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
+
+/// Timestamp of a peer admission event (seconds since UNIX epoch).
+type AdmissionTimestamp = u64;
+
+/// A peer admission record for HTTP observability. W7: the bootnode's /peers
+/// endpoint surfaces these so operators can verify attestation admission on
+/// the dstack pod (no logs available there).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PeerAdmission {
+    /// Party id of the admitted peer.
+    pub party_id: usize,
+    /// Hex of the peer's attested measurement (`blake3(mr_td‖rtmr0..3)`).
+    /// Present only when the peer presented TDX evidence (dstack mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measurement_hex: Option<String>,
+    /// Unix timestamp (seconds) of when the peer was admitted.
+    pub admitted_at: AdmissionTimestamp,
+}
+
+/// A peer rejection record for HTTP observability. W7: /peers surfaces these
+/// so operators can debug attestation failures on the dstack pod.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PeerRejection {
+    /// Human-readable reason for rejection.
+    pub reason: String,
+    /// Unix timestamp (seconds) of when the peer was rejected.
+    pub rejected_at: AdmissionTimestamp,
+}
+
+/// All peer admission/rejection records for HTTP observability.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AdmissionRecords {
+    /// Peers admitted to the committee.
+    pub admitted: Vec<PeerAdmission>,
+    /// Peers rejected (e.g., bad attestation, duplicate, wrong program).
+    pub rejected: Vec<PeerRejection>,
+}
+
+/// W7: Callback for admission events (used by stoffel-run to update HTTP
+/// observability /peers endpoint). Called with the current admission records
+/// whenever a peer is admitted or rejected.
+pub type AdmissionCallback = Arc<dyn Fn(AdmissionRecords) + Send + Sync>;
 
 #[derive(Debug, Clone)]
 struct PendingSession {
@@ -69,6 +112,13 @@ pub(super) struct BootnodeState {
     /// measurement is allowlisted and whose cert binds the presented
     /// `tls_derived_id`.
     attestation: Option<Arc<AdmissionAttestation>>,
+    /// W7: Admission/rejection records for HTTP observability. The /peers
+    /// endpoint surfaces these so operators can verify attestation admission on
+    /// the dstack pod (no logs available there).
+    admission_records: Arc<Mutex<AdmissionRecords>>,
+    /// W7: Optional callback to invoke when admission records change (used by
+    /// stoffel-run to update HTTP observability /peers endpoint).
+    admission_callback: Option<AdmissionCallback>,
 }
 
 #[derive(Clone)]
@@ -100,7 +150,18 @@ impl BootnodeState {
             session_tx,
             ice_tx,
             attestation: attestation.map(Arc::new),
+            admission_records: Arc::new(Mutex::new(AdmissionRecords {
+                admitted: Vec::new(),
+                rejected: Vec::new(),
+            })),
+            admission_callback: None,
         }
+    }
+
+    /// W7: Set the callback to invoke when admission records change (called by
+    /// stoffel-run to update HTTP observability /peers endpoint).
+    pub fn set_admission_callback(&mut self, callback: AdmissionCallback) {
+        self.admission_callback = Some(callback);
     }
 
     /// Returns true when attestation admission is enabled.
@@ -167,6 +228,79 @@ impl BootnodeState {
             .iter()
             .map(|(pid, addr)| (*pid, *addr))
             .collect()
+    }
+
+    /// W7: Record a peer admission. Called when a peer successfully registers
+    /// and passes attestation verification (if enabled). The measurement hex is
+    /// extracted from the attestation evidence when present (mock mode only;
+    /// dstack mode measurement extraction would require re-parsing the quote).
+    pub async fn record_admission(
+        &self,
+        party_id: PartyId,
+        attestation: Option<&AttestationEvidence>,
+    ) {
+        let measurement_hex = attestation.and_then(|ev| {
+            // MockQuote exposes the measurement directly.
+            if let AttestationEvidence::Mock(ref q) = ev {
+                return Some(hex::encode(q.measurement));
+            }
+            // DstackQuote: the measurement is embedded in the raw quote but
+            // extracting it requires re-parsing the TD report. For W7 observability
+            // we skip this; the admission is still recorded with party_id and time.
+            None
+        });
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let admission = PeerAdmission {
+            party_id,
+            measurement_hex,
+            admitted_at: now,
+        };
+
+        let mut records = self.admission_records.lock().await;
+        records.admitted.push(admission);
+        let records_clone = records.clone();
+        drop(records);
+
+        // W7: Invoke callback if set (e.g., to update HTTP observability).
+        if let Some(ref cb) = self.admission_callback {
+            cb(records_clone);
+        }
+    }
+
+    /// W7: Record a peer rejection. Called when attestation verification fails,
+    /// or when a duplicate/wrong-program registration is rejected.
+    pub async fn record_rejection(&self, reason: String) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let rejection = PeerRejection {
+            reason,
+            rejected_at: now,
+        };
+
+        let mut records = self.admission_records.lock().await;
+        records.rejected.push(rejection);
+        let records_clone = records.clone();
+        drop(records);
+
+        // W7: Invoke callback if set (e.g., to update HTTP observability).
+        if let Some(ref cb) = self.admission_callback {
+            cb(records_clone);
+        }
+    }
+
+    /// W7: Get a snapshot of admission/rejection records for HTTP observability.
+    /// The /peers endpoint uses this to surface the attestation gate state on the
+    /// dstack pod (no logs available there).
+    pub async fn admission_records(&self) -> AdmissionRecords {
+        self.admission_records.lock().await.clone()
     }
 
     pub async fn store_program_bytes_if_missing(
@@ -579,6 +713,8 @@ impl BootnodeConnection {
                 "[bootnode] Rejected RegisterWithSession from party {} (invalid auth token)",
                 party_id
             );
+            // W7: Record the rejection for /peers observability.
+            self.state.record_rejection("invalid auth token".to_string()).await;
             self.waiting_for_session = false;
             return;
         }
@@ -593,10 +729,13 @@ impl BootnodeConnection {
             registration.attestation.as_ref(),
             registration.tls_derived_id,
         ) {
+            let reason = format!("attestation: {}", err);
             eprintln!(
-                "[bootnode] Rejected RegisterWithSession from party {} (attestation: {})",
-                party_id, err
+                "[bootnode] Rejected RegisterWithSession from party {} ({})",
+                party_id, reason
             );
+            // W7: Record the rejection for /peers observability.
+            self.state.record_rejection(reason.clone()).await;
             let _ = send_ctrl(&*self.conn, &DiscoveryMessage::PeerLeft { party_id }).await;
             self.waiting_for_session = false;
             return;
@@ -634,6 +773,10 @@ impl BootnodeConnection {
 
         self.waiting_for_session = true;
 
+        // W7: Extract attestation before registration (it's moved in the call).
+        let attestation_clone = registration.attestation.clone();
+        let program_id_for_mismatch = registration.program_id;
+
         let report = match self.state.register_session(registration).await {
             Ok(report) => report,
             Err(err) => {
@@ -649,9 +792,13 @@ impl BootnodeConnection {
         match report.event {
             SessionRegistrationEvent::Created { target_parties } => {
                 eprintln!(
-                    "[bootnode] Created pending session, waiting for {} parties (have 1)",
+                    "[bootnode] Created pending pending session, waiting for {} parties (have 1)",
                     target_parties
                 );
+                // W7: Record the admission for /peers observability.
+                self.state
+                    .record_admission(party_id, attestation_clone.as_ref())
+                    .await;
             }
             SessionRegistrationEvent::Joined {
                 registered_parties,
@@ -661,12 +808,20 @@ impl BootnodeConnection {
                     "[bootnode] Party {} joined, have {}/{} parties",
                     party_id, registered_parties, target_parties
                 );
+                // W7: Record the admission for /peers observability.
+                self.state
+                    .record_admission(party_id, attestation_clone.as_ref())
+                    .await;
             }
             SessionRegistrationEvent::RejectedProgramMismatch => {
+                let reason = format!("program_id mismatch (expected {})",
+                    hex::encode(&self.state.program_bytes_for(&program_id_for_mismatch).await.is_some().then_some("cached").unwrap_or("pending")));
                 eprintln!(
                     "[bootnode] Warning: party {} has different program_id",
                     party_id
                 );
+                // W7: Record the rejection for /peers observability.
+                self.state.record_rejection(reason).await;
                 let _ = send_ctrl(&*self.conn, &DiscoveryMessage::PeerLeft { party_id }).await;
                 self.waiting_for_session = false;
                 return;
@@ -676,6 +831,8 @@ impl BootnodeConnection {
                     "[bootnode] Rejected RegisterWithSession from party {} (duplicate party_id)",
                     party_id
                 );
+                // W7: Record the rejection for /peers observability.
+                self.state.record_rejection("duplicate party_id".to_string()).await;
                 let _ = send_ctrl(&*self.conn, &DiscoveryMessage::PeerLeft { party_id }).await;
                 self.waiting_for_session = false;
                 return;

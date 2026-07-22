@@ -1,0 +1,15 @@
+# W7 demo program: Minimal HoneyBadger program using Share.random.
+# No client inputs — the secret share is generated jointly by the committee.
+# This works at t=0 (n>=3t+1 allows n=2 t=0) and demonstrates the
+# attestation-gated committee running end-to-end.
+
+def main() -> bytes:
+  # Each party jointly generates a random share via HoneyBadger preprocessing.
+  # At t=0, this is a pseudo-random share derived from the public seed.
+  var share = Share.random()
+
+  # Get the commitment to the share (demonstrates AVSS-style usage).
+  var commitment = Share.get_commitment(share)
+
+  # Return the commitment as the result.
+  return commitment

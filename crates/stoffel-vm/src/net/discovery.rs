@@ -8,6 +8,10 @@ use super::attestation::{
 use super::session::{SessionInfo, SessionMessage};
 use bincode;
 use bootnode::{spawn_connection_handler, BootnodeState};
+
+// W7: Re-export admission observability types so stoffel-vm-runner can use them
+// for the /peers HTTP endpoint.
+pub use bootnode::{AdmissionCallback, AdmissionRecords, PeerAdmission, PeerRejection};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, net::SocketAddr, time::Duration};
 use stoffelnet::network_utils::{Network, PartyId};
@@ -228,12 +232,36 @@ pub(crate) async fn run_bootnode_with_config_and_attestation(
     required_auth_token: Option<String>,
     attestation: Option<AdmissionAttestation>,
 ) -> Result<(), String> {
+    run_bootnode_with_config_and_attestation_and_callback(
+        bind,
+        expected_parties,
+        required_auth_token,
+        attestation,
+        None,
+    )
+    .await
+}
+
+/// Run bootnode with an optional admission callback (W7: updates HTTP
+/// observability /peers endpoint when peers are admitted/rejected).
+pub async fn run_bootnode_with_config_and_attestation_and_callback(
+    bind: SocketAddr,
+    expected_parties: Option<usize>,
+    required_auth_token: Option<String>,
+    attestation: Option<AdmissionAttestation>,
+    admission_callback: Option<AdmissionCallback>,
+) -> Result<(), String> {
     let mut net = QuicNetworkManager::with_config(QuicNetworkConfig {
         use_tls: false,
         ..Default::default()
     });
     net.listen(bind).await?;
-    let state = BootnodeState::new_with_attestation(expected_parties, attestation);
+    let mut state = BootnodeState::new_with_attestation(expected_parties, attestation);
+
+    // W7: Set the admission callback if provided (e.g., to update HTTP observability).
+    if let Some(cb) = admission_callback {
+        state.set_admission_callback(cb);
+    }
 
     eprintln!("[bootnode] Listening on {}", bind);
 

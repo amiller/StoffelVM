@@ -37,6 +37,10 @@ RUN apt-get update && apt-get install -y \
 ENV CC=clang
 ENV CXX=clang++
 
+# Cap build parallelism: un-capped rustc has OOM-frozen both build hosts.
+ARG CARGO_BUILD_JOBS=2
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+
 WORKDIR /build
 COPY . .
 
@@ -59,6 +63,19 @@ RUN --mount=type=ssh \
 RUN --mount=type=ssh \
     cargo test --release -p stoffel-vm --features attestation-dstack --lib --no-run
 
+# W7: Build the StoffelLang compiler (dev-dependency, not included in slim node
+# build) to compile the demo program from source during image build. This ensures
+# reproducibility — the demo bytecode is derived from the committed source.
+RUN --mount=type=ssh \
+    cargo build --release --package stoffellang && \
+    strip target/release/stoffellang
+
+# W7: Compile the demo program from source (docker/programs/demo_program.stfl).
+# The resulting bytecode is baked into the image at /app/programs/program.stflb.
+RUN --mount=type=ssh \
+    ./target/release/stoffellang -b docker/programs/demo_program.stfl \
+        -o /tmp/program.stflb
+
 # ============================================================================
 # Stage 2: Runtime (slim)
 # ============================================================================
@@ -77,6 +94,10 @@ WORKDIR /app
 # Slim node binary (no compiler — W1).
 COPY --from=builder /build/target/release/stoffel-run /app/stoffel-run
 
+# W7: Demo program (AVSS keygen using Share.random, no client inputs).
+# Compiled from source in the builder stage (docker/programs/demo_program.stfl).
+COPY --from=builder /tmp/program.stflb /app/programs/program.stflb
+
 # W5 real-TDX attestation test binary (stable path).
 RUN --mount=from=builder,source=/build/target,target=/tmp/target \
     cp "$(ls -t /tmp/target/release/deps/stoffel_vm-* | grep -vE '\.(d|so)$' | head -n1)" \
@@ -86,8 +107,12 @@ RUN --mount=from=builder,source=/build/target,target=/tmp/target \
 # dstack app manifest (dstack/stoffel-node.yaml). MODE=dstack selects real TDX;
 # the allowlist pins the expected image measurement so a wrong/tampered image is
 # refused admission.
+#
+# W7: Committee defaults. n=2 t=0 is the smallest valid committee that
+# satisfies the HoneyBadger constraint (n >= 3t + 1). This works for
+# demo purposes and is the easiest to test locally with docker-compose.
 ENV STOFFEL_BIND_ADDR="0.0.0.0:9000"
-ENV STOFFEL_N_PARTIES="5"
+ENV STOFFEL_N_PARTIES="4"
 ENV STOFFEL_THRESHOLD="1"
 ENV STOFFEL_ROLE="party"
 ENV STOFFEL_PARTY_ID="0"

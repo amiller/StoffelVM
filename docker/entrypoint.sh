@@ -14,10 +14,36 @@ validate_env() {
 
 validate_env
 
-# Resolve the IP address peers should use to connect to this node.
-# STOFFEL_ADVERTISE_IP can be set explicitly; otherwise auto-detect from
-# the primary network interface (works for ECS Fargate and docker-compose, but not for EC2!).
-if [ -z "${STOFFEL_ADVERTISE_IP:-}" ]; then
+# W7: Resolve the IP address peers should use to connect to this node.
+# STOFFEL_ADVERTISE_HOST can be set to a container hostname that will be
+# resolved via Docker DNS on the shared bridge network. Retry loop handles
+# the case where DNS isn't immediately available.
+# STOFFEL_ADVERTISE_IP can be set explicitly for direct IP configuration.
+# If neither is set, auto-detect from the primary network interface.
+if [ -n "${STOFFEL_ADVERTISE_HOST:-}" ]; then
+    echo "Resolving STOFFEL_ADVERTISE_HOST=${STOFFEL_ADVERTISE_HOST} via getent hosts..."
+    max_attempts=30
+    attempt=1
+    resolved_ip=""
+
+    while [ $attempt -le $max_attempts ]; do
+        resolved_ip=$(getent hosts "${STOFFEL_ADVERTISE_HOST}" 2>/dev/null | awk '{print $1; exit}')
+        if [ -n "$resolved_ip" ]; then
+            echo "Resolved ${STOFFEL_ADVERTISE_HOST} to ${resolved_ip} (attempt ${attempt}/${max_attempts})"
+            STOFFEL_ADVERTISE_IP="$resolved_ip"
+            break
+        fi
+        echo "Attempt ${attempt}/${max_attempts}: ${STOFFEL_ADVERTISE_HOST} not yet resolvable, waiting..."
+        sleep 1
+        attempt=$((attempt + 1))
+    done
+
+    if [ -z "$resolved_ip" ]; then
+        echo "ERROR: STOFFEL_ADVERTISE_HOST=${STOFFEL_ADVERTISE_HOST} could not be resolved after ${max_attempts} attempts"
+        echo "The DNS name may not be configured correctly on the bridge network."
+        exit 5
+    fi
+elif [ -z "${STOFFEL_ADVERTISE_IP:-}" ]; then
     STOFFEL_ADVERTISE_IP=$(hostname -i | awk '{print $1}')
 fi
 
@@ -33,7 +59,11 @@ else
     echo "Party ID: ${STOFFEL_PARTY_ID}"
     echo "Bind Address: ${STOFFEL_BIND_ADDR}"
     echo "Bootstrap: ${STOFFEL_BOOTSTRAP_ADDR:-N/A}"
-    echo "Advertise IP: ${STOFFEL_ADVERTISE_IP}"
+    if [ -n "${STOFFEL_ADVERTISE_HOST:-}" ]; then
+        echo "Advertise IP: ${STOFFEL_ADVERTISE_IP} (from STOFFEL_ADVERTISE_HOST=${STOFFEL_ADVERTISE_HOST})"
+    else
+        echo "Advertise IP: ${STOFFEL_ADVERTISE_IP} (auto-detected)"
+    fi
     echo "Expected Clients: ${STOFFEL_EXPECTED_CLIENTS:-none}"
 fi
 echo "N Parties: ${STOFFEL_N_PARTIES}"
