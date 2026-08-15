@@ -4,7 +4,7 @@
 set -e
 set -a; . ~/projects/oauth3-apps/.staging-env; set +a
 IMAGE=$1; MEAS=$2
-TOKEN=${STOFFEL_AUTH_TOKEN:?set STOFFEL_AUTH_TOKEN}
+TOKEN=${STOFFEL_AUTH_TOKEN:?set STOFFEL_AUTH_TOKEN to the committee registration secret}
 BOOT=tee-image-stoffel-node-attested
 NP='"NO_PROXY":"pccs.phala.network,api.trustedservices.intel.com","no_proxy":"pccs.phala.network,api.trustedservices.intel.com"'
 common="\"STOFFEL_N_PARTIES\":\"4\",\"STOFFEL_THRESHOLD\":\"1\",\"STOFFEL_HTTP_ADDR\":\"0.0.0.0:8090\",

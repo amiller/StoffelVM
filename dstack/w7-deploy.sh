@@ -5,7 +5,7 @@
 set -e
 set -a; . ~/projects/oauth3-apps/.staging-env; set +a
 IMAGE=$1; MEAS=$2; MODE=${3:-all}
-TOKEN=${STOFFEL_AUTH_TOKEN:?set STOFFEL_AUTH_TOKEN}
+TOKEN=${STOFFEL_AUTH_TOKEN:?set STOFFEL_AUTH_TOKEN to the committee registration secret}
 BOOT_CONTAINER=tee-image-stoffel-node-attested
 
 deploy() {

@@ -3,7 +3,7 @@
 set -e
 set -a; . ~/projects/oauth3-apps/.staging-env; set +a
 IMAGE=$1; MEAS=$2
-TOKEN=${STOFFEL_AUTH_TOKEN:?set STOFFEL_AUTH_TOKEN}
+TOKEN=${STOFFEL_AUTH_TOKEN:?set STOFFEL_AUTH_TOKEN to the committee registration secret}
 NP='"NO_PROXY":"pccs.phala.network,api.trustedservices.intel.com","no_proxy":"pccs.phala.network,api.trustedservices.intel.com"'
 curl -sm 90 -X POST "$WEBHOST_STAGING/_api/projects" -H "Authorization: Bearer $TEE_DAEMON_TOKEN" \
  -H "Content-Type: application/json" -d "{\"name\":\"stoffel-p0\",\"runtime\":\"image\",\"mode\":\"attested\",
