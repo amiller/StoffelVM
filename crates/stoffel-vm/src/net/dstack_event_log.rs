@@ -191,8 +191,9 @@ pub fn verify_event_log(
 mod tests {
     use super::*;
 
-    /// A real event log captured from the running dstack pod, with the register
-    /// values from the same quote.
+    /// An event log whose shape and digest convention were captured from a live
+    /// dstack CVM, with deployment-identifying payloads replaced and the
+    /// registers recomputed so the fixture stays internally consistent.
     fn fixture() -> (String, serde_json::Value) {
         let log = include_str!("../../tests/fixtures/dstack/pod_event_log.json");
         let regs: serde_json::Value =
@@ -211,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn real_pod_log_reconstructs_every_register() {
+    fn captured_log_reconstructs_every_register() {
         let (log, regs) = fixture();
         let r = rtmr_bytes(&regs);
         let identity = verify_event_log(&log, [&r[0], &r[1], &r[2], &r[3]]).expect("verify");
@@ -220,10 +221,7 @@ mod tests {
             identity.compose_hash.as_deref(),
             Some("ea07fc3d1894fe056c43d21ad1b57bc626f43a1b2b9aef1d974907a1fee68eba")
         );
-        assert_eq!(
-            identity.app_id.as_deref(),
-            Some("78ffc78c25e0c8a9e64bb3a969ba6f226abae62d")
-        );
+        assert_eq!(identity.app_id.as_deref(), Some(&"a".repeat(40)[..]));
         assert_eq!(
             identity.os_image_hash.as_deref(),
             Some("de9c74f0c85d0820ce075cb4a99f8e39f7b681be632907c5bf8bdc95ea72feb9")
