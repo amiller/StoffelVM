@@ -7,6 +7,10 @@ pub(crate) mod broadcast;
 pub mod client_store;
 pub mod curve;
 pub mod discovery;
+/// dstack RTMR event-log verification. Only meaningful with real TDX evidence,
+/// and it needs `serde_json`, which that feature pulls in.
+#[cfg(feature = "attestation-dstack")]
+pub mod dstack_event_log;
 pub(crate) mod group_interpolation;
 pub mod hb_server;
 pub mod mpc;
