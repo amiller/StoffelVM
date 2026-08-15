@@ -15,12 +15,63 @@ validate_env() {
 validate_env
 
 # W7: Resolve the IP address peers should use to connect to this node.
-# STOFFEL_ADVERTISE_HOST can be set to a container hostname that will be
-# resolved via Docker DNS on the shared bridge network. Retry loop handles
-# the case where DNS isn't immediately available.
-# STOFFEL_ADVERTISE_IP can be set explicitly for direct IP configuration.
-# If neither is set, auto-detect from the primary network interface.
-if [ -n "${STOFFEL_ADVERTISE_HOST:-}" ]; then
+#
+# A tenant here sits on TWO docker networks: its own private per-project network
+# and the shared egress bridge every committee member joins. Only the shared one
+# is routable between parties. Resolving our OWN container name (the old
+# STOFFEL_ADVERTISE_HOST path) asks docker DNS for a name that exists on both,
+# and the order is not defined — a party that draws its private address
+# advertises somewhere no peer can reach, every peer connect times out, and the
+# run dies in preprocessing with PartyNotFound.
+#
+# The bootstrap address pins the answer: docker DNS resolves the bootnode's name
+# to its address on a network WE SHARE with it, so our own address on that same
+# network is the one to advertise. Pick the local address with the longest
+# leading-octet match against the resolved bootstrap IP.
+# The shared network is attached AFTER the container starts, so early on our
+# only address is the private one. Accept a candidate only when it shares the
+# peer's /24 — anything less means the shared interface isn't up yet.
+pick_ip_on_peer_network() {
+    local peer_ip=$1 prefix ip
+    prefix=$(echo "$peer_ip" | cut -d. -f1-3)
+    for ip in $(hostname -I); do
+        case "$ip" in *:*) continue;; esac
+        if [ "$(echo "$ip" | cut -d. -f1-3)" = "$prefix" ]; then echo "$ip"; return 0; fi
+    done
+    return 1
+}
+
+if [ -n "${STOFFEL_ADVERTISE_HOST:-}" ] && [ -n "${STOFFEL_BOOTSTRAP_ADDR:-}" ]; then
+    bootstrap_host=$(echo "${STOFFEL_BOOTSTRAP_ADDR}" | cut -d: -f1)
+    echo "Selecting advertise IP on the network shared with ${bootstrap_host}..."
+    max_attempts=30
+    attempt=1
+    peer_ip=""
+    while [ $attempt -le $max_attempts ]; do
+        peer_ip=$(getent hosts "${bootstrap_host}" 2>/dev/null | awk '{print $1; exit}')
+        [ -n "$peer_ip" ] && break
+        echo "Attempt ${attempt}/${max_attempts}: ${bootstrap_host} not yet resolvable, waiting..."
+        sleep 1
+        attempt=$((attempt + 1))
+    done
+    if [ -z "$peer_ip" ]; then
+        echo "ERROR: bootstrap host ${bootstrap_host} could not be resolved after ${max_attempts} attempts"
+        exit 5
+    fi
+    attempt=1
+    STOFFEL_ADVERTISE_IP=""
+    while [ $attempt -le $max_attempts ]; do
+        STOFFEL_ADVERTISE_IP=$(pick_ip_on_peer_network "$peer_ip") && break
+        echo "Attempt ${attempt}/${max_attempts}: no local address on ${peer_ip%.*}.0/24 yet (have: $(hostname -I)), waiting..."
+        sleep 1
+        attempt=$((attempt + 1))
+    done
+    if [ -z "$STOFFEL_ADVERTISE_IP" ]; then
+        echo "ERROR: never got an address on the bootstrap's network ${peer_ip%.*}.0/24 (have: $(hostname -I))"
+        exit 5
+    fi
+    echo "Bootstrap ${bootstrap_host} is ${peer_ip}; advertising ${STOFFEL_ADVERTISE_IP} (local addrs: $(hostname -I))"
+elif [ -n "${STOFFEL_ADVERTISE_HOST:-}" ]; then
     echo "Resolving STOFFEL_ADVERTISE_HOST=${STOFFEL_ADVERTISE_HOST} via getent hosts..."
     max_attempts=30
     attempt=1

@@ -84,6 +84,24 @@ pub struct ObservabilitySnapshot {
     /// or rejected via attestation, and why.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admission_records: Option<AdmissionRecords>,
+    /// W7: the program this party ran and the value it opened, recorded when
+    /// the run completes. On the pod there are no tenant logs, so without this
+    /// "the committee agreed on a value" is unobservable from outside.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub program_result: Option<ProgramResult>,
+}
+
+/// A completed run: which program, and what this party opened.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct ProgramResult {
+    /// Program id the committee agreed to run (blake3 prefix, as logged).
+    pub program_id: String,
+    /// Entry function name.
+    pub entry: String,
+    /// The opened value, formatted exactly as the node prints it.
+    pub value: String,
+    /// Unix seconds at which the run completed.
+    pub completed_at: u64,
 }
 
 impl ObservabilitySnapshot {
@@ -144,6 +162,7 @@ impl ObservabilityState {
                 tls_derived_id: None,
                 tcb_status: None,
                 admission_records: None,
+                program_result: None,
             })),
         }
     }
@@ -168,6 +187,25 @@ impl ObservabilityState {
     pub async fn update_admission_records(&self, records: AdmissionRecords) {
         let mut guard = self.inner.write().await;
         guard.admission_records = Some(records);
+    }
+
+    /// W7: record the value this party opened once the run completes. `/result`
+    /// surfaces it, so a committee that agreed on a value can be checked from
+    /// outside the CVM by comparing `/result` across the parties.
+    pub async fn record_program_result(
+        &self,
+        program_id: impl Into<String>,
+        entry: impl Into<String>,
+        value: impl Into<String>,
+        completed_at: u64,
+    ) {
+        let mut guard = self.inner.write().await;
+        guard.program_result = Some(ProgramResult {
+            program_id: program_id.into(),
+            entry: entry.into(),
+            value: value.into(),
+            completed_at,
+        });
     }
 
     /// Point-in-time snapshot for serializing a response.
@@ -283,11 +321,12 @@ async fn dispatch(path: Option<String>, state: &ObservabilityState) -> (&'static
         Some("/health") => ("200 OK", health_body(&snapshot)),
         Some("/attestation") => ("200 OK", attestation_body(&snapshot)),
         Some("/peers") => ("200 OK", peers_body(&snapshot)),
+        Some("/result") => ("200 OK", result_body(&snapshot)),
         // No error-masking routing: unknown paths are a real 404, not a silent
         // /health fallback that could mask a misconfigured probe.
         _ => (
             "404 Not Found",
-            r#"{"error":"not found","routes":["GET /health","GET /attestation","GET /peers"]}"#.to_string(),
+            r#"{"error":"not found","routes":["GET /health","GET /attestation","GET /peers","GET /result"]}"#.to_string(),
         ),
     }
 }
@@ -300,6 +339,15 @@ fn health_body(snapshot: &ObservabilitySnapshot) -> String {
 fn attestation_body(snapshot: &ObservabilitySnapshot) -> String {
     serde_json::to_string(&snapshot.attestation_json())
         .unwrap_or_else(|_| r#"{"attestation_mode":"disabled"}"#.to_string())
+}
+
+/// W7: `/result` body. `{"status":"pending"}` until the run completes — an
+/// absent result is reported as absent, never as a fabricated value.
+fn result_body(snapshot: &ObservabilitySnapshot) -> String {
+    match &snapshot.program_result {
+        Some(r) => serde_json::to_string(r).expect("serialize program result"),
+        None => r#"{"status":"pending"}"#.to_string(),
+    }
 }
 
 /// W7: /peers body. Returns admission records (admitted/rejected peers with

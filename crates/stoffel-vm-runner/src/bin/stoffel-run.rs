@@ -1006,7 +1006,7 @@ fn fail_removed_flag(raw_args: &[String], old_flag: &str, replacement_hint: &str
     }
 }
 
-fn print_vm_result(vm: &mut VirtualMachine, result: Value) {
+fn print_vm_result(vm: &mut VirtualMachine, result: Value) -> String {
     let result = if matches!(result, Value::Share(_, _)) && vm.mpc_runtime_info().is_some() {
         eprintln!("Program returned a secret share, revealing...");
         match vm.open_share_value(&result) {
@@ -1020,7 +1020,7 @@ fn print_vm_result(vm: &mut VirtualMachine, result: Value) {
         result
     };
 
-    match &result {
+    let rendered = match &result {
         Value::Array(arr_ref) => {
             if let Some(bytes) = vm
                 .read_byte_array(&Value::from(*arr_ref))
@@ -1028,13 +1028,15 @@ fn print_vm_result(vm: &mut VirtualMachine, result: Value) {
                 .filter(|bytes| !bytes.is_empty())
             {
                 let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
-                println!("Program returned: byte[{}] 0x{}", bytes.len(), hex);
+                format!("byte[{}] 0x{}", bytes.len(), hex)
             } else {
-                println!("Program returned: {}", format_vm_value(vm, &result, 4));
+                format_vm_value(vm, &result, 4)
             }
         }
-        _ => println!("Program returned: {}", format_vm_value(vm, &result, 4)),
-    }
+        _ => format_vm_value(vm, &result, 4),
+    };
+    println!("Program returned: {}", rendered);
+    rendered
 }
 
 fn format_vm_value(vm: &mut VirtualMachine, value: &Value, max_depth: usize) -> String {
@@ -5334,6 +5336,7 @@ async fn main() {
         online_started_at.elapsed().as_millis()
     );
 
+    let mut rendered_result: Option<String> = None;
     match execution_result {
         Ok(result) => {
             {
@@ -5415,17 +5418,45 @@ async fn main() {
                             }
                         }
                     }
-                    print_vm_result(&mut vm, result.clone());
+                    rendered_result = Some(print_vm_result(&mut vm, result.clone()));
                 }
 
                 if !handled_by_coordinator {
-                    print_vm_result(&mut vm, result);
+                    rendered_result = Some(print_vm_result(&mut vm, result));
                 }
             }
         }
         Err(err) => {
             eprintln!("Execution error in '{}': {}", agreed_entry, err);
             exit(4);
+        }
+    }
+
+    // W7: publish what this party opened so `/result` can be compared across
+    // the committee. Without this the pod has no tenant logs and "all parties
+    // agreed" is unobservable from outside the CVM.
+    if let Some(rendered) = rendered_result {
+        let completed_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        observability
+            .record_program_result(
+                hex::encode(&program_id[..8]),
+                &agreed_entry,
+                rendered,
+                completed_at,
+            )
+            .await;
+    }
+
+    // A party normally exits here, taking its /result with it. STOFFEL_HOLD_OPEN
+    // keeps the process alive serving the observability endpoints so an operator
+    // can read the run off the pod.
+    if std::env::var("STOFFEL_HOLD_OPEN").is_ok_and(|v| v == "true" || v == "1") {
+        eprintln!("[http] STOFFEL_HOLD_OPEN set: staying up to serve /result");
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
     }
 }

@@ -1,0 +1,18 @@
+### /stoffel-node/peers
+{"admitted":[{"party_id":0,"admitted_at":1786828708},{"party_id":1,"admitted_at":1786828715},{"party_id":2,"admitted_at":1786828722},{"party_id":3,"admitted_at":1786828728}],"rejected":[]}
+### stoffel-p0
+  health:      {"status":"ok","role":"party","party_id":0}
+  attestation: {"attestation_mode":"dstack","measurement":"3dbc0ef7a6766c3d2739920f280d821cf343b5b0a3a111825daad9779923aa3f","tls_derived_id":17123862653665091236,"tcb_status":"UpToDate"}
+  result:      {"program_id":"7144a194d6364ed2","entry":"main","value":"-7264172825354124299","completed_at":1786828731}
+### stoffel-p1
+  health:      {"status":"ok","role":"party","party_id":1}
+  attestation: {"attestation_mode":"dstack","measurement":"3dbc0ef7a6766c3d2739920f280d821cf343b5b0a3a111825daad9779923aa3f","tls_derived_id":328251011340950811,"tcb_status":"UpToDate"}
+  result:      {"program_id":"7144a194d6364ed2","entry":"main","value":"-7264172825354124299","completed_at":1786828731}
+### stoffel-p2
+  health:      {"status":"ok","role":"party","party_id":2}
+  attestation: {"attestation_mode":"dstack","measurement":"3dbc0ef7a6766c3d2739920f280d821cf343b5b0a3a111825daad9779923aa3f","tls_derived_id":4990157949877081373,"tcb_status":"UpToDate"}
+  result:      {"program_id":"7144a194d6364ed2","entry":"main","value":"-7264172825354124299","completed_at":1786828731}
+### stoffel-p3
+  health:      {"status":"ok","role":"party","party_id":3}
+  attestation: {"attestation_mode":"dstack","measurement":"3dbc0ef7a6766c3d2739920f280d821cf343b5b0a3a111825daad9779923aa3f","tls_derived_id":7685563358042763982,"tcb_status":"UpToDate"}
+  result:      {"program_id":"7144a194d6364ed2","entry":"main","value":"-7264172825354124299","completed_at":1786828731}

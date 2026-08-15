@@ -40,7 +40,7 @@ Branch `w7-committee-demo` (laptop `~/projects/stoffel-w7`; zed mirror branch `w
   with real measurement → redeploy parties → admitted, program runs. Auth token reused from the
   7/14 deployment.
 
-## W7 pod bring-up — DONE on the pod 2026-08-15 (attested committee verified)
+## W7 pod bring-up — DONE 2026-08-15 (attested committee forms AND computes)
 The 7/22 deploy went out but was never verified; it had in fact never worked. Two blockers,
 both found and fixed on 8/15:
 
@@ -61,13 +61,41 @@ both found and fixed on 8/15:
   (fail-closed gate proven, and the measurement the parties present matches the offline computation)
 - `/stoffel-p0/attestation` → `{"measurement":"3dbc0ef7…","tls_derived_id":17731227442834126731,"tcb_status":"UpToDate"}`
 
-**Still unverified: the program result.** Parties are run-to-completion and the daemon restarts
-them (~66s cycle, visible as repeat admissions + `duplicate party_id` rejections), so admission is
-proven but "all 4 opened the same value" is not — that needs container logs. The pod daemon
-predates `e8bb9a2d` (`GET /_api/projects/<name>/logs`), so it has no logs route; deploying that
-daemon build is the unblock. Debug method used instead: a throwaway attested image tenant
-(`ghcr.io/amiller/stoffel-dstack:probe`, source in the session scratchpad) that reports
-`/run/broker` contents, a raw `GetQuote` over the socket, and PCCS reachability as JSON on 8090.
+Admission was proven first, but the RUN was still failing — the ~66s restart cycle (repeat
+admissions + `duplicate party_id`) was parties timing out, not completing. Two more blockers:
+
+3. **Parties advertised an unroutable address.** Each tenant sits on TWO docker networks: its
+   private `tee-proj-<name>-attested` and the shared egress bridge. `STOFFEL_ADVERTISE_HOST` was
+   the container's own name, and resolving your OWN name hits a name present on both networks with
+   no defined order — so a party could advertise e.g. `192.168.96.3`, which no peer can reach.
+   Every peer connect timed out and preprocessing died with
+   `RanShaError(NetworkError(PartyNotFound(1)))`. Fix (`docker/entrypoint.sh`): resolve the
+   BOOTSTRAP host — docker DNS returns its address on a network we share — and advertise our own
+   address on that same /24.
+4. **Startup race on the shared network.** tee-daemon attaches the egress network AFTER
+   `docker start`, so early on the container's only address is the private one. The first fix still
+   picked it for whichever party won the race. Fix: retry until a local address on the bootstrap's
+   /24 exists, hard-fail after 30s rather than advertising something unroutable.
+
+**Program result VERIFIED on the pod 2026-08-15** — `dstack/w7-pod-evidence.txt`. All four parties
+opened the identical value on the same program:
+`{"program_id":"7144a194d6364ed2","entry":"main","value":"-7264172825354124299","completed_at":1786828731}`
+with four DISTINCT `tls_derived_id`s and the same measurement, `tcb_status: UpToDate`.
+
+Two additions made this observable, both worth keeping:
+- **`GET /result`** on the observability server (`http_observability.rs`), plus `STOFFEL_HOLD_OPEN=true`
+  so a party stays up serving it instead of exiting and taking its result with it. Comparing
+  `/result` across parties is the "the committee agreed" check.
+- **A debug image layer** (`docker/debug-entrypoint.sh`): runs the node with stdout+stderr captured
+  to a file, then execs `busybox httpd` on the same proxied port, so a crashed node's full log is
+  readable at `/<project>/node.log`. This is what finally surfaced the peer-connect timeouts. The
+  pod daemon predates `e8bb9a2d` (`GET /_api/projects/<name>/logs`), so it has no logs route;
+  deploying that daemon build would make this layer unnecessary.
+
+Images: `w7.2` = /result + hold-open; `w7.3`/`w7.4` add the advertise fix (**w7.4** =
+`sha256:8bc4843e7f1d136b78d804fc73ec9e50ef3a2152ef9311f1e82924476c663bc6`, the verified one, and it
+carries the debug log layer). Earlier debug tenant: `ghcr.io/amiller/stoffel-dstack:probe` reports
+`/run/broker` contents, a raw `GetQuote`, and PCCS reachability as JSON.
 
 Other notes: pod OCI runtime is `runc`, not gVisor (`/_api/substrate`) — the `11ac89f` commit
 message's gVisor attribution for ping/nc is wrong; `nc` is simply absent from the image. Local
