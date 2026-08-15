@@ -85,7 +85,8 @@ pub struct MockQuote {
 ///
 /// The verifier ([`DstackAttestor`]) checks the report signature against the
 /// collateral's Intel-signed certificate chain, then extracts the attested
-/// measurement (TD `mr_td` + `rtmr0..3`) and the cert binding (`report_data`).
+/// measurement (TD `mr_td` + `rtmr0..2`) and the cert binding (`report_data`),
+/// and replays the event log onto the quote's registers to recover app identity.
 #[cfg(feature = "attestation-dstack")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DstackQuote {
@@ -95,6 +96,11 @@ pub struct DstackQuote {
     /// verify the quote's signature against the Intel root of trust. Fetched
     /// once by the attesting node and carried with the quote.
     pub collateral: QuoteCollateralV3,
+    /// The dstack RTMR event log, as returned with the quote. Host-supplied
+    /// JSON until the verifier replays it onto the quote's registers — see
+    /// [`crate::net::dstack_event_log::verify_event_log`].
+    #[serde(default)]
+    pub event_log: String,
 }
 
 /// What a successfully verified quote proves about the attesting node.
@@ -248,6 +254,15 @@ pub struct DstackAttestor {
     /// expired collateral is rejected in production; injectable via
     /// [`DstackAttestor::with_verify_time`] for reproducible verification.
     verify_time: u64,
+    /// Require the registrant to carry an RTMR event log that replays onto the
+    /// quote's registers. This is operator policy in the same sense the
+    /// measurement allowlist is: when on, a quote with no (or a non-anchoring)
+    /// log is refused. The node turns it on; quote-only unit tests leave it off
+    /// so they exercise exactly the quote path they are about.
+    require_event_log: bool,
+    /// Accepted `compose-hash` values read out of the anchored event log. Empty
+    /// means "do not constrain which app", which is the CVM-stack-only claim.
+    expected_compose_hashes: Vec<String>,
 }
 
 #[cfg(feature = "attestation-dstack")]
@@ -258,6 +273,56 @@ impl DstackAttestor {
     pub fn new() -> Self {
         Self {
             verify_time: wall_clock_secs(),
+            require_event_log: false,
+            expected_compose_hashes: Vec::new(),
+        }
+    }
+
+    /// Require an RTMR event log that replays onto the quote's registers, and
+    /// optionally constrain the `compose-hash` it records. This is what turns
+    /// the CVM-stack claim into an app claim.
+    pub fn requiring_event_log(mut self, expected_compose_hashes: Vec<String>) -> Self {
+        self.require_event_log = true;
+        self.expected_compose_hashes = expected_compose_hashes;
+        self
+    }
+
+    /// Replay the registrant's event log onto the registers of its own quote,
+    /// then check the app identity that log records.
+    ///
+    /// The replay is the load-bearing step. Until the fold lands on the RTMRs
+    /// Intel signed, the log is just JSON the host handed us; afterwards, every
+    /// event in it is as trustworthy as the quote.
+    fn verify_app_identity(
+        &self,
+        rtmrs: &QuoteRtmrs,
+        event_log: &str,
+    ) -> Result<(), AttestationError> {
+        use crate::net::dstack_event_log::verify_event_log;
+
+        if event_log.trim().is_empty() {
+            return Err(AttestationError::DstackVerify(
+                "event log is required but the registrant presented none".to_string(),
+            ));
+        }
+
+        let identity = verify_event_log(
+            event_log,
+            [&rtmrs[0][..], &rtmrs[1][..], &rtmrs[2][..], &rtmrs[3][..]],
+        )
+        .map_err(|e| AttestationError::DstackVerify(format!("event log: {e}")))?;
+
+        if self.expected_compose_hashes.is_empty() {
+            return Ok(());
+        }
+        match identity.compose_hash {
+            Some(ref found) if self.expected_compose_hashes.contains(found) => Ok(()),
+            Some(found) => Err(AttestationError::DstackVerify(format!(
+                "compose-hash {found} is not in the expected set"
+            ))),
+            None => Err(AttestationError::DstackVerify(
+                "event log records no compose-hash to check".to_string(),
+            )),
         }
     }
 
@@ -266,7 +331,11 @@ impl DstackAttestor {
     /// a known-good image measurement captured on staging) where the
     /// collateral's validity window predates the current wall clock.
     pub fn with_verify_time(verify_time: u64) -> Self {
-        Self { verify_time }
+        Self {
+            verify_time,
+            require_event_log: false,
+            expected_compose_hashes: Vec::new(),
+        }
     }
 }
 
@@ -289,7 +358,12 @@ impl Attestor for DstackAttestor {
     ) -> Result<VerifiedAttestation, AttestationError> {
         match evidence {
             AttestationEvidence::Dstack(quote) => {
-                verify_dstack_quote(&quote.raw, &quote.collateral, self.verify_time)
+                let (verified, rtmrs) =
+                    verify_dstack_quote_with_registers(&quote.raw, &quote.collateral, self.verify_time)?;
+                if self.require_event_log {
+                    self.verify_app_identity(&rtmrs, &quote.event_log)?;
+                }
+                Ok(verified)
             }
             // Mock evidence presented to a dstack attestor: reject, do not
             // fall back to treating it as anything else.
@@ -334,6 +408,20 @@ impl AdmissionAttestation {
     #[cfg(feature = "attestation-dstack")]
     pub fn new_dstack(allowed_measurements: Vec<Measurement>) -> Self {
         Self::new(Box::new(DstackAttestor::new()), allowed_measurements)
+    }
+
+    /// Real-TDX admission that additionally requires an RTMR event log which
+    /// replays onto the registrant's own quote, optionally constrained to a set
+    /// of `compose-hash` values.
+    #[cfg(feature = "attestation-dstack")]
+    pub fn new_dstack_with_event_log(
+        allowed_measurements: Vec<Measurement>,
+        expected_compose_hashes: Vec<String>,
+    ) -> Self {
+        Self::new(
+            Box::new(DstackAttestor::new().requiring_event_log(expected_compose_hashes)),
+            allowed_measurements,
+        )
     }
 
     pub fn kind(&self) -> AttestorKind {
@@ -451,6 +539,21 @@ pub fn verify_dstack_quote(
     collateral: &QuoteCollateralV3,
     now_secs: u64,
 ) -> Result<VerifiedAttestation, AttestationError> {
+    verify_dstack_quote_with_registers(raw_quote, collateral, now_secs).map(|(v, _)| v)
+}
+
+/// The four RTMR values read out of a verified TD report, in order.
+#[cfg(feature = "attestation-dstack")]
+pub type QuoteRtmrs = [[u8; 48]; 4];
+
+/// As [`verify_dstack_quote`], but also hands back the quote's RTMR0..3 so a
+/// caller can anchor an event log against them without verifying twice.
+#[cfg(feature = "attestation-dstack")]
+pub fn verify_dstack_quote_with_registers(
+    raw_quote: &[u8],
+    collateral: &QuoteCollateralV3,
+    now_secs: u64,
+) -> Result<(VerifiedAttestation, QuoteRtmrs), AttestationError> {
     // Full Intel trust-chain verification (QE/ISV signatures, PCK cert chain,
     // TCB info + QE identity collateral, CRLs) anchored at the Intel trusted
     // root CA. `rustcrypto` selects the pure-Rust crypto backend (p256/sha2);
@@ -469,15 +572,28 @@ pub fn verify_dstack_quote(
         )
     })?;
 
-    // Fold the full TD measurement register set into the W3 32-byte
-    // [`Measurement`]. Every register is hardware-attested, so this digest
-    // uniquely identifies the running image (firmware + kernel + app).
+    // Fold the BOOT-TIME registers into the W3 32-byte [`Measurement`]: mr_td
+    // (firmware/td-shim) plus RTMR0..2 (virtual firmware, kernel, initrd and
+    // config). These are fixed once the TD is up, so a pin over them is stable
+    // for the life of the CVM.
+    //
+    // RTMR3 is excluded ON PURPOSE, and the app identity it carries is NOT
+    // dropped — it moves to `net::dstack_event_log::verify_event_log`, which
+    // replays the event log into all four registers (RTMR3 included) and
+    // requires each to equal the value in this Intel-verified quote before
+    // reading `compose-hash` / `app-id` / `os-image-hash` back out. Checking a
+    // named, anchored event is strictly more informative than pinning an opaque
+    // digest over it.
+    //
+    // Pinning RTMR3 was also simply not operable: it is the runtime-extended
+    // register and the platform appends a deployment event per app promote.
+    // Observed on the pod, three distinct digests inside one hour with mr_td and
+    // RTMR0..2 byte-identical across all three.
     let mut hasher = blake3::Hasher::new();
     hasher.update(&td.mr_td);
     hasher.update(&td.rt_mr0);
     hasher.update(&td.rt_mr1);
     hasher.update(&td.rt_mr2);
-    hasher.update(&td.rt_mr3);
     let measurement: Measurement = *hasher.finalize().as_bytes();
 
     // Cert binding: the LE `tls_derived_id` the attesting node wrote at the
@@ -507,11 +623,16 @@ pub fn verify_dstack_quote(
         "dstack TDX quote verified against Intel root of trust"
     );
 
-    Ok(VerifiedAttestation {
-        measurement,
-        cert_pubkey_hash,
-        tcb_status: verified.status,
-    })
+    let rtmrs: QuoteRtmrs = [td.rt_mr0, td.rt_mr1, td.rt_mr2, td.rt_mr3];
+
+    Ok((
+        VerifiedAttestation {
+            measurement,
+            cert_pubkey_hash,
+            tcb_status: verified.status,
+        },
+        rtmrs,
+    ))
 }
 
 /// dstack device-manager RPC endpoints used to mint a quote. See
@@ -531,6 +652,10 @@ const DSTACK_DEFAULT_SOCKET: &str = "/var/run/dstack.sock";
 struct DstackGetQuoteResponse {
     /// Hex-encoded raw TD quote.
     quote: String,
+    /// The RTMR event log dstack returns alongside the quote. Carried with the
+    /// evidence so the verifier can replay it against the quote's registers.
+    #[serde(default)]
+    event_log: String,
 }
 
 /// Obtain real dstack TDX attestation evidence binding this node's TLS cert
@@ -622,7 +747,11 @@ pub async fn obtain_dstack_evidence(tls_derived_id: PartyId) -> Result<Attestati
         "obtained dstack TDX quote bound to node TLS identity"
     );
 
-    Ok(AttestationEvidence::Dstack(DstackQuote { raw, collateral }))
+    Ok(AttestationEvidence::Dstack(DstackQuote {
+        raw,
+        collateral,
+        event_log: parsed.event_log,
+    }))
 }
 
 /// Pull the JSON object out of an HTTP/1.1 response read to EOF. Locates the
@@ -663,6 +792,14 @@ fn extract_json_body(resp: &[u8]) -> Result<Vec<u8>, String> {
 
 const ENV_MODE: &str = "STOFFEL_ATTESTATION_MODE";
 const ENV_ALLOWED: &str = "STOFFEL_ATTESTATION_ALLOWED_MEASUREMENTS";
+/// Require the RTMR event log to replay onto the registrant's quote. Defaults
+/// to ON for `dstack` mode: the log is what carries app identity now that the
+/// pinned measurement covers only the boot registers. Set to `false` to accept
+/// a quote with no log, which narrows the claim to the CVM stack alone.
+const ENV_REQUIRE_EVENT_LOG: &str = "STOFFEL_ATTESTATION_REQUIRE_EVENT_LOG";
+/// Comma-separated `compose-hash` values accepted out of the anchored log.
+/// Empty means "any app on this CVM stack".
+const ENV_EXPECTED_COMPOSE: &str = "STOFFEL_ATTESTATION_EXPECTED_COMPOSE_HASHES";
 const ENV_MOCK_KEY: &str = "STOFFEL_ATTESTATION_MOCK_KEY";
 
 /// Build an attestation admission policy from the environment.
@@ -697,7 +834,23 @@ pub fn attestation_admission_from_env() -> Result<Option<AdmissionAttestation>, 
                         "{ENV_MODE}=dstack requires {ENV_ALLOWED} to list at least one measurement"
                     ));
                 }
-                return Ok(Some(AdmissionAttestation::new_dstack(allowed)));
+                let require_log = std::env::var(ENV_REQUIRE_EVENT_LOG)
+                    .map(|v| {
+                        let v = v.trim().to_ascii_lowercase();
+                        v != "false" && v != "0"
+                    })
+                    .unwrap_or(true);
+                let compose: Vec<String> = std::env::var(ENV_EXPECTED_COMPOSE)
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                return Ok(Some(if require_log {
+                    AdmissionAttestation::new_dstack_with_event_log(allowed, compose)
+                } else {
+                    AdmissionAttestation::new_dstack(allowed)
+                }));
             }
             #[cfg(not(feature = "attestation-dstack"))]
             {
@@ -1111,6 +1264,7 @@ mod tests {
         let bad = E::Dstack(DstackQuote {
             raw: vec![0u8; 4],
             collateral: collateral.clone(),
+            event_log: String::new(),
         });
         let err = attestor.verify(&bad).expect_err("malformed quote must reject");
         assert!(matches!(err, AttestationError::DstackVerify(_)), "got {err:?}");
@@ -1162,6 +1316,7 @@ mod tests {
         let evidence = AttestationEvidence::Dstack(DstackQuote {
             raw,
             collateral: collateral.clone(),
+            event_log: String::new(),
         });
         let adm = AdmissionAttestation::new(
             Box::new(DstackAttestor::with_verify_time(now)),
@@ -1187,7 +1342,7 @@ mod tests {
         let now = now_in_collateral_window(&raw, &collateral);
         let verified = verify_dstack_quote(&raw, &collateral, now).expect("verify");
         let cert = verified.cert_pubkey_hash;
-        let evidence = AttestationEvidence::Dstack(DstackQuote { raw, collateral });
+        let evidence = AttestationEvidence::Dstack(DstackQuote { raw, collateral, event_log: String::new() });
 
         // Allowlist only the mock "GOOD_MEASUREMENT" (unrelated to the real
         // quote's measurement) -> the real measurement is refused.
@@ -1217,7 +1372,7 @@ mod tests {
         let measurement = verified.measurement;
         let real_cert = verified.cert_pubkey_hash;
         let impostor_cert = real_cert.wrapping_add(1);
-        let evidence = AttestationEvidence::Dstack(DstackQuote { raw, collateral });
+        let evidence = AttestationEvidence::Dstack(DstackQuote { raw, collateral, event_log: String::new() });
 
         let adm = AdmissionAttestation::new(
             Box::new(DstackAttestor::with_verify_time(now)),
