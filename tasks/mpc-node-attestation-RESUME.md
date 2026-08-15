@@ -40,6 +40,40 @@ Branch `w7-committee-demo` (laptop `~/projects/stoffel-w7`; zed mirror branch `w
   with real measurement → redeploy parties → admitted, program runs. Auth token reused from the
   7/14 deployment.
 
+## W7 pod bring-up — DONE on the pod 2026-08-15 (attested committee verified)
+The 7/22 deploy went out but was never verified; it had in fact never worked. Two blockers,
+both found and fixed on 8/15:
+
+1. **Stale measurement pin.** The pod CVM was upgraded since 7/22, so the pinned
+   `f24fe216…` no longer matched. Current: `3dbc0ef7a6766c3d2739920f280d821cf343b5b0a3a111825daad9779923aa3f`
+   (recompute with `measurement_from_quote.py` off `/_api/verification/<project>` after any pod upgrade).
+2. **`ALL_PROXY` kills the DCAP collateral fetch.** `egress:true` — required for party↔bootnode
+   QUIC — makes tee-daemon inject `ALL_PROXY=socks5://egress-vpn:1080`. The `reqwest` under
+   `dcap-qvl` is built WITHOUT the socks feature (no `tokio-socks` in Cargo.lock), so
+   `obtain_dstack_evidence` fails at the PCCS fetch and the party `exit(13)`s in ~1s — before it
+   registers, so `/peers` showed neither an admission nor a rejection. Fix: set
+   `NO_PROXY`/`no_proxy` for the PCCS hosts (now in `w7-deploy.sh:common_env`). PCCS is reachable
+   directly from a tenant, so bypassing the proxy is enough.
+
+**Verified on the pod (n=4, t=1, real TDX):**
+- real pin → all 4 parties admitted in `/peers`, no rejections
+- zeros pin → all 4 rejected: `attestation: attestation measurement 3dbc0ef7… is not in the allowlist`
+  (fail-closed gate proven, and the measurement the parties present matches the offline computation)
+- `/stoffel-p0/attestation` → `{"measurement":"3dbc0ef7…","tls_derived_id":17731227442834126731,"tcb_status":"UpToDate"}`
+
+**Still unverified: the program result.** Parties are run-to-completion and the daemon restarts
+them (~66s cycle, visible as repeat admissions + `duplicate party_id` rejections), so admission is
+proven but "all 4 opened the same value" is not — that needs container logs. The pod daemon
+predates `e8bb9a2d` (`GET /_api/projects/<name>/logs`), so it has no logs route; deploying that
+daemon build is the unblock. Debug method used instead: a throwaway attested image tenant
+(`ghcr.io/amiller/stoffel-dstack:probe`, source in the session scratchpad) that reports
+`/run/broker` contents, a raw `GetQuote` over the socket, and PCCS reachability as JSON on 8090.
+
+Other notes: pod OCI runtime is `runc`, not gVisor (`/_api/substrate`) — the `11ac89f` commit
+message's gVisor attribution for ping/nc is wrong; `nc` is simply absent from the image. Local
+two-network docker repro of the pod topology (bootnode + party on separate project networks +
+shared egress net, attestation disabled) passes and is the fastest non-pod check.
+
 ## Paseo access (zed)
 ```bash
 ssh zed 'echo ok'
