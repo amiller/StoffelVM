@@ -13,6 +13,9 @@ common_env() {
 "STOFFEL_DSTACK_SOCKET":"/run/broker/dstack.sock",
 "STOFFEL_ATTESTATION_ALLOWED_MEASUREMENTS":"$MEAS",
 "STOFFEL_AUTH_TOKEN":"$TOKEN",
+"NO_PROXY":"pccs.phala.network,api.trustedservices.intel.com",
+"no_proxy":"pccs.phala.network,api.trustedservices.intel.com",
+"STOFFEL_HOLD_OPEN":"true",
 "RUST_LOG":"stoffel::attestation=debug,info"
 EOG
 }

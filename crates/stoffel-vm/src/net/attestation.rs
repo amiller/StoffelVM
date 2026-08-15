@@ -586,9 +586,9 @@ pub fn verify_dstack_quote_with_registers(
     // digest over it.
     //
     // Pinning RTMR3 was also simply not operable: it is the runtime-extended
-    // register and the platform appends a deployment event per app promote.
-    // Observed on the pod, three distinct digests inside one hour with mr_td and
-    // RTMR0..2 byte-identical across all three.
+    // register, carrying per-boot and per-deployment events. Observed on the
+    // pod, three distinct digests inside one hour (spanning a CVM restart) with
+    // mr_td and RTMR0..2 byte-identical across all three.
     let mut hasher = blake3::Hasher::new();
     hasher.update(&td.mr_td);
     hasher.update(&td.rt_mr0);

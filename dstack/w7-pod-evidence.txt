@@ -1,28 +1,30 @@
 # Stoffel attested committee — pod evidence
-# image  ghcr.io/amiller/stoffel-dstack@sha256:7b43d3c5cc98193dd536b4bb3471b82c882ff115bd4b005a79954445138337f5  (tag w7.5)
-# built  docker build -f docker/dstack.Dockerfile .   (no overlay, no debug layer)
-# pinned measurement 3dbc0ef7a6766c3d2739920f280d821cf343b5b0a3a111825daad9779923aa3f
-# captured 2026-08-15T22:02:24Z
+# image        ghcr.io/amiller/stoffel-dstack@sha256:35f0a17d7a46067b2ea968253cda5e5a04aab02090afd03f924db614c57148cb  (tag w7.6)
+# built by     docker build -f docker/dstack.Dockerfile .   (no overlay, no debug layer)
+# pinned       c5c28030fadd6fd685b0007d02a453ae40e8aa950d95b7ab11427103016ddfb5
+#              = blake3(mr_td || rtmr0 || rtmr1 || rtmr2); RTMR3 verified via the event log, not pinned
+# event log    required at admission (STOFFEL_ATTESTATION_REQUIRE_EVENT_LOG defaults on)
+# captured     2026-08-15T23:25:58Z
 
 ### GET /stoffel-node/peers
-{"admitted":[{"party_id":0,"admitted_at":1786831069},{"party_id":1,"admitted_at":1786831075},{"party_id":2,"admitted_at":1786831081},{"party_id":3,"admitted_at":1786831088}],"rejected":[]}
+{"admitted":[{"party_id":0,"admitted_at":1786836042},{"party_id":1,"admitted_at":1786836049},{"party_id":2,"admitted_at":1786836055},{"party_id":3,"admitted_at":1786836062}],"rejected":[]}
 
 ### stoffel-p0
   /health      {"status":"ok","role":"party","party_id":0}
-  /attestation {"attestation_mode":"dstack","measurement":"3dbc0ef7a6766c3d2739920f280d821cf343b5b0a3a111825daad9779923aa3f","tls_derived_id":8414933720070376506,"tcb_status":"UpToDate"}
-  /result      {"program_id":"7144a194d6364ed2","entry":"main","value":"8846249324095206338","completed_at":1786831090}
+  /attestation {"attestation_mode":"dstack","measurement":"c5c28030fadd6fd685b0007d02a453ae40e8aa950d95b7ab11427103016ddfb5","tls_derived_id":17002393024715824550,"tcb_status":"UpToDate"}
+  /result      {"program_id":"7144a194d6364ed2","entry":"main","value":"-4645747589851520984","completed_at":1786836064}
 
 ### stoffel-p1
   /health      {"status":"ok","role":"party","party_id":1}
-  /attestation {"attestation_mode":"dstack","measurement":"3dbc0ef7a6766c3d2739920f280d821cf343b5b0a3a111825daad9779923aa3f","tls_derived_id":17682090773150863187,"tcb_status":"UpToDate"}
-  /result      {"program_id":"7144a194d6364ed2","entry":"main","value":"8846249324095206338","completed_at":1786831090}
+  /attestation {"attestation_mode":"dstack","measurement":"c5c28030fadd6fd685b0007d02a453ae40e8aa950d95b7ab11427103016ddfb5","tls_derived_id":6746756146887130905,"tcb_status":"UpToDate"}
+  /result      {"program_id":"7144a194d6364ed2","entry":"main","value":"-4645747589851520984","completed_at":1786836064}
 
 ### stoffel-p2
   /health      {"status":"ok","role":"party","party_id":2}
-  /attestation {"attestation_mode":"dstack","measurement":"3dbc0ef7a6766c3d2739920f280d821cf343b5b0a3a111825daad9779923aa3f","tls_derived_id":17724520138487437370,"tcb_status":"UpToDate"}
-  /result      {"program_id":"7144a194d6364ed2","entry":"main","value":"8846249324095206338","completed_at":1786831090}
+  /attestation {"attestation_mode":"dstack","measurement":"c5c28030fadd6fd685b0007d02a453ae40e8aa950d95b7ab11427103016ddfb5","tls_derived_id":15243419626202361534,"tcb_status":"UpToDate"}
+  /result      {"program_id":"7144a194d6364ed2","entry":"main","value":"-4645747589851520984","completed_at":1786836064}
 
 ### stoffel-p3
   /health      {"status":"ok","role":"party","party_id":3}
-  /attestation {"attestation_mode":"dstack","measurement":"3dbc0ef7a6766c3d2739920f280d821cf343b5b0a3a111825daad9779923aa3f","tls_derived_id":4548430301980372353,"tcb_status":"UpToDate"}
-  /result      {"program_id":"7144a194d6364ed2","entry":"main","value":"8846249324095206338","completed_at":1786831090}
+  /attestation {"attestation_mode":"dstack","measurement":"c5c28030fadd6fd685b0007d02a453ae40e8aa950d95b7ab11427103016ddfb5","tls_derived_id":15060249417481226423,"tcb_status":"UpToDate"}
+  /result      {"program_id":"7144a194d6364ed2","entry":"main","value":"-4645747589851520984","completed_at":1786836064}

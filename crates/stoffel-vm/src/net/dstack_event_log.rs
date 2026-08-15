@@ -4,11 +4,12 @@
 //!
 //! The admission gate pins a measurement. The obvious digest to pin — one over
 //! `mr_td` and all four RTMRs — is **not stable**: RTMR3 is the runtime-extended
-//! register, and the platform keeps appending deployment events to it. Measured
-//! directly on the pod: three different values inside one hour, with `mr_td` and
-//! RTMR0..2 byte-identical across all three. A pin over RTMR3 therefore goes
-//! stale between deploying the bootnode and deploying the parties, and every
-//! party is refused against a value nobody could have pinned in advance.
+//! register, and its contents are per-boot and per-deployment (the log carries
+//! `instance-id` and a `tee-daemon/promote` event per app). Measured directly on
+//! the pod: three different values inside one hour, spanning a CVM restart, with
+//! `mr_td` and RTMR0..2 byte-identical across all three. A pin over RTMR3 goes
+//! stale under the running system, and every party is then refused against a
+//! value nobody could have pinned in advance.
 //!
 //! Dropping RTMR3 from the pin fixes the stability problem but throws away what
 //! RTMR3 actually carries — the app identity dstack records at boot
@@ -22,9 +23,8 @@
 //! 2. Read the named boot events out of the now-anchored log and hand them back
 //!    as an [`AppIdentity`] the caller can check against expected values.
 //!
-//! The volatile part of RTMR3 (one `tee-daemon/promote` event per app
-//! deployment) still moves, but it no longer matters: it is covered by the
-//! replay, and nothing pins it.
+//! The volatile part of RTMR3 still moves, but it no longer matters: it is
+//! covered by the replay, and nothing pins it.
 //!
 //! ## Digest convention
 //!

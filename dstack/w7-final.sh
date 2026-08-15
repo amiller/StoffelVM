@@ -10,7 +10,7 @@ NP='"NO_PROXY":"pccs.phala.network,api.trustedservices.intel.com","no_proxy":"pc
 common="\"STOFFEL_N_PARTIES\":\"4\",\"STOFFEL_THRESHOLD\":\"1\",\"STOFFEL_HTTP_ADDR\":\"0.0.0.0:8090\",
 \"STOFFEL_ATTESTATION_MODE\":\"dstack\",\"STOFFEL_DSTACK_SOCKET\":\"/run/broker/dstack.sock\",
 \"STOFFEL_ATTESTATION_ALLOWED_MEASUREMENTS\":\"$MEAS\",\"STOFFEL_AUTH_TOKEN\":\"$TOKEN\",
-\"RUST_LOG\":\"stoffel::attestation=debug,info\",$NP"
+\"RUST_LOG\":\"stoffel::attestation=debug,info\",\"STOFFEL_HOLD_OPEN\":\"true\",$NP"
 post() { curl -sm 90 -X POST "$WEBHOST_STAGING/_api/projects" \
   -H "Authorization: Bearer $TEE_DAEMON_TOKEN" -H "Content-Type: application/json" \
   -d "$1" -o /dev/null -w "http=%{http_code}\n"; }
