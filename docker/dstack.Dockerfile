@@ -60,8 +60,17 @@ RUN --mount=type=ssh \
 # Also compile (do not run) the lib test binary with the feature so the staging
 # image can self-prove its verifier against a real Intel-issued TDX quote
 # vector on boot (see docker/test-dstack-attestation.sh).
+#
+# Ask cargo where it put the executable rather than globbing a layout. Current
+# nightly emits unittest binaries under target/release/build/<pkg>/<hash>/out/,
+# not target/release/deps/, so a glob of deps/ silently matches nothing and the
+# image build dies several stages later with a bare `cp: cannot stat ''`.
 RUN --mount=type=ssh \
-    cargo test --release -p stoffel-vm --features attestation-dstack --lib --no-run
+    cargo test --release -p stoffel-vm --features attestation-dstack --lib --no-run \
+        --message-format=json > /tmp/test-build.json && \
+    exe="$(grep -o '"executable":"[^"]*"' /tmp/test-build.json | tail -n1 | cut -d'"' -f4)" && \
+    if [ -z "$exe" ]; then echo "no test executable reported by cargo" >&2; exit 1; fi && \
+    cp "$exe" /build/w5_attestation_test
 
 # W7: Build the StoffelLang compiler (dev-dependency, not included in slim node
 # build) to compile the demo program from source during image build. This ensures
@@ -98,10 +107,9 @@ COPY --from=builder /build/target/release/stoffel-run /app/stoffel-run
 # Compiled from source in the builder stage (docker/programs/demo_program.stfl).
 COPY --from=builder /tmp/program.stflb /app/programs/program.stflb
 
-# W5 real-TDX attestation test binary (stable path).
-RUN --mount=from=builder,source=/build/target,target=/tmp/target \
-    cp "$(ls -t /tmp/target/release/deps/stoffel_vm-* | grep -vE '\.(d|so)$' | head -n1)" \
-       /usr/local/bin/w5_attestation_test
+# W5 real-TDX attestation test binary (stable path). The builder already
+# resolved its location, so this is a plain copy.
+COPY --from=builder /build/w5_attestation_test /usr/local/bin/w5_attestation_test
 
 # Default environment. STOFFEL_ATTESTATION_* are overridden per-replica by the
 # dstack app manifest (dstack/stoffel-node.yaml). MODE=dstack selects real TDX;

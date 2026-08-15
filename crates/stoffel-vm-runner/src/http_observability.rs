@@ -401,6 +401,7 @@ mod tests {
             measurement: None,
             tls_derived_id: None,
             tcb_status: None,
+            ..Default::default()
         };
         let v = snap.health_json();
         assert_eq!(v["status"], "ok");
@@ -420,6 +421,7 @@ mod tests {
             measurement: None,
             tls_derived_id: None,
             tcb_status: None,
+            ..Default::default()
         };
         let v = snap.health_json();
         assert_eq!(v["status"], "ok");
@@ -436,6 +438,7 @@ mod tests {
             measurement: None,
             tls_derived_id: None,
             tcb_status: None,
+            ..Default::default()
         };
         let v = snap.attestation_json();
         assert_eq!(v["attestation_mode"], "disabled");
@@ -664,7 +667,57 @@ mod tests {
         assert_eq!(v["admitted"][0]["admitted_at"], now);
 
         assert_eq!(v["rejected"].as_array().unwrap().len(), 1);
-        assert!(v["rejected"][0]["reason"].as_str().contains("MeasurementNotAllowed"));
+        assert!(v["rejected"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("MeasurementNotAllowed"));
         assert_eq!(v["rejected"][0]["rejected_at"], now);
+    }
+
+    #[tokio::test]
+    async fn result_endpoint_is_pending_before_the_run_completes() {
+        let state = ObservabilityState::new("party", Some(0), "dstack");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(accept_loop(listener, state));
+
+        let (status, body) = get(addr, "/result").await;
+        assert_eq!(status, "200");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        // No fabrication: an absent result reports as absent, never as a value.
+        assert_eq!(v["status"], "pending");
+        assert!(v.get("value").is_none());
+    }
+
+    #[tokio::test]
+    async fn result_endpoint_reports_what_the_party_opened() {
+        let state = ObservabilityState::new("party", Some(2), "dstack");
+        state
+            .record_program_result("7144a194d6364ed2", "main", "-7264172825354124299", 1786828731)
+            .await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(accept_loop(listener, state));
+
+        let (status, body) = get(addr, "/result").await;
+        assert_eq!(status, "200");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["program_id"], "7144a194d6364ed2");
+        assert_eq!(v["entry"], "main");
+        assert_eq!(v["value"], "-7264172825354124299");
+        assert_eq!(v["completed_at"], 1786828731u64);
+        assert!(v.get("status").is_none());
+    }
+
+    #[tokio::test]
+    async fn unknown_route_advertises_result() {
+        let state = ObservabilityState::new("party", Some(0), "disabled");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(accept_loop(listener, state));
+
+        let (status, body) = get(addr, "/nope").await;
+        assert_eq!(status, "404");
+        assert!(body.contains("GET /result"));
     }
 }
