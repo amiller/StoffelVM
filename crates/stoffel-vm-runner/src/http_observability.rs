@@ -383,6 +383,7 @@ fn http_response(status: &'static str, body: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stoffel_vm::net::discovery::{PeerAdmission, PeerRejection};
 
     fn state(role: &str, party_id: Option<usize>, mode: &str) -> ObservabilityState {
         ObservabilityState::new(role, party_id, mode)
