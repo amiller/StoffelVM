@@ -9,7 +9,12 @@
 #   ./scripts/agent-build.sh test  -p stoffel-vm --features attestation-dstack --lib net::lobby
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
-TARGET=${CARGO_TARGET_DIR:-$HOME/cargo-targets/$(basename "$REPO")}
+# ONE shared target dir on purpose. Each copy of this workspace's build output
+# is ~16G and this host has ~30G free, so per-agent dirs do not fit. Sharing it
+# also means concurrent agents serialize on cargo's lock instead of running two
+# un-capped rustc processes at once, which is the failure mode that has frozen
+# this machine before.
+TARGET=${CARGO_TARGET_DIR:-$HOME/cargo-targets/shared}
 mkdir -p "$TARGET"
 exec docker run --rm \
   --memory=8g --cpus=2 \
