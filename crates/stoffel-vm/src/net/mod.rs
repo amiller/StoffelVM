@@ -12,6 +12,10 @@ pub mod discovery;
 #[cfg(feature = "attestation-dstack")]
 pub mod dstack_event_log;
 pub(crate) mod group_interpolation;
+/// Lobby record schema shared by the verifier, the lobby service, and the
+/// webapp. Feature-gated because records carry TDX attestation evidence.
+#[cfg(feature = "attestation-dstack")]
+pub mod lobby;
 pub mod hb_server;
 pub mod mpc;
 pub mod mpc_runner;
